@@ -274,6 +274,8 @@ namespace BTC
                 case Net::ScaleNet:   prefix = &bitcoin::ScaleNetChainParams.cashaddrPrefix; break;
                 case Net::ChipNet:    prefix = &bitcoin::ChipNetChainParams.cashaddrPrefix; break;
                 case Net::RegTestNet: prefix = &bitcoin::RegTestNetChainParams.cashaddrPrefix; break;
+                case Net::AlphaNet:   prefix = &bitcoin::MainNetChainParams.cashaddrPrefix; break; // Use mainnet prefix for Alpha
+                case Net::AlphaTestNet: prefix = &bitcoin::TestNetChainParams.cashaddrPrefix; break; // Use testnet prefix for AlphaTest
                 case Net::Invalid:    break;
                 }
                 if (prefix) {

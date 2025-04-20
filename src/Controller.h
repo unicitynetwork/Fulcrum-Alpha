@@ -69,11 +69,10 @@ public:
     /// for debug printing when it receives new mempool tx's.
     static void printMempoolStatusToLog(size_t newSize, size_t numAddresses, double msec, bool useDebugLogger, bool force = false);
 
-    /// Thread-safe, lock-free, returns true for BTC and LTC
+    /// Thread-safe, lock-free, returns true for BTC and LTC and ALPHA
     bool isSegWitCoin() const {
         auto const c = coinType.load(std::memory_order_relaxed);
-        return c == BTC::Coin::BTC || c == BTC::Coin::LTC;
-    }
+        return c == BTC::Coin::BTC || c == BTC::Coin::LTC || c == BTC::Coin::ALPHA;    }
 
     /// Thread-safe, lock-free, returns true for LTC
     bool isMimbleWimbleCoin() const { return coinType.load(std::memory_order_relaxed) == BTC::Coin::LTC; }
@@ -85,6 +84,9 @@ public:
         const auto type = coinType.load(std::memory_order_relaxed);
         return type == BTC::Coin::BCH || type == BTC::Coin::Unknown;
     }
+    
+    /// Thread-safe, lock-free, returns true for Alpha
+    bool isAlphaCoin() const { return coinType.load(std::memory_order_relaxed) == BTC::Coin::ALPHA; }
 
     /// Type used internally by the putRpaIndex signal
     struct RpaOnlyModeData {

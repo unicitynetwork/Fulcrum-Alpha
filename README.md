@@ -3,9 +3,62 @@
 [![Docker Build](https://github.com/cculianu/Fulcrum/actions/workflows/publish.yml/badge.svg)](https://github.com/cculianu/Fulcrum/actions/workflows/publish.yml)
 [![Copr build status](https://copr.fedorainfracloud.org/coprs/jonny/BitcoinCash/package/fulcrum/status_image/last_build.png)](https://copr.fedorainfracloud.org/coprs/jonny/BitcoinCash/package/fulcrum/)
 
-A fast & nimble SPV server for Bitcoin Cash, Bitcoin BTC, and Litecoin. 
+A fast & nimble SPV server for Bitcoin Cash, Bitcoin BTC, Litecoin, and Alpha. 
 
 For more information, visit [The Official Fulcrum Website™️](https://fulcrumserver.org/).
+
+# Unicity Support for Fulcrum
+
+## Introduction
+
+This fork of Fulcrum adds support for the Unicity blockchain Proof of Work layer (Alpha currency), which utilizes RandomX for its proof-of-work algorithm after a specific block). RandomX is a CPU-friendly, ASIC-resistant proof-of-work algorithm designed to be more accessible to regular users without specialized mining hardware.
+
+## Key Features
+
+- **RandomX Block Support**: Full support for Alpha's RandomX blocks, which feature an extended header format (112 bytes vs standard 80 bytes)
+- **Dynamic Block Detection**: Identifies RandomX blocks through version flags (`0x20000000` bit) 
+- **Efficient Serialization**: Specialized serialization/deserialization for RandomX blocks
+- **Alpha Chain Integration**: Full support for the Alpha coin type and network configurations
+
+## Technical Implementation Details
+
+The codebase makes certain assumptions about the blockchain format:
+
+- **Block Header Size**: Different block header sizes depending on the blockchain type:
+  ```cpp
+  constexpr int GetBlockHeaderSize(bool isAlphaRandomX = false) noexcept { 
+      return isAlphaRandomX ? 112 : 80; 
+  }
+  ```
+  - Standard Bitcoin-like chains use 80-byte headers
+  - Alpha chain with RandomX uses 112-byte headers
+
+## Important Security Considerations
+
+**⚠️ TRUST BOUNDARY ASSUMPTION ⚠️**
+
+This fork operates under the assumption that Fulcrum runs within the same trust boundary as the Alpha node. The implementation **bypasses normal hash validation for RandomX blocks** for several reasons:
+
+1. RandomX proof-of-work validation is computationally intensive
+2. The validation is delegated to the Alpha node that Fulcrum connects to
+3. The node is presumed to be within your security perimeter
+
+This means that Fulcrum depends on your node to properly validate the RandomX proof-of-work for these blocks. **Do not run this software with an untrusted or remote node unless you have secured the connection through other means.**
+
+## Usage
+
+To use this fork with the Alpha chain:
+1. Configure your Alpha node as you would normally
+2. In your Fulcrum configuration, set `coin=alpha` to specify the Alpha cryptocurrency
+3. Point Fulcrum to your Alpha node using the standard connection parameters
+
+For Alpha-specific settings, refer to the example configuration in `doc/alpha.conf`.
+
+## Technical Implementation
+
+The implementation identifies RandomX blocks using the `0x20000000` bit in the block version field. If the versioning changes in future releases this code must be updated as well.
+
+---
 
 #### Copyright
 (C) 2019-2025 Calin Culianu <calin.culianu@gmail.com>

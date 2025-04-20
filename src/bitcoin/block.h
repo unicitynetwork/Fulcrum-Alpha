@@ -29,6 +29,8 @@ public:
     uint32_t nTime;
     uint32_t nBits;
     uint32_t nNonce;
+    // Alpha extension
+    uint256 hashRandomX;
 
     CBlockHeader() noexcept { SetNull(); }
 
@@ -39,6 +41,13 @@ public:
         READWRITE(obj.nTime);
         READWRITE(obj.nBits);
         READWRITE(obj.nNonce);
+        
+        // Alpha extension - only serialize hashRandomX for Alpha chain
+        // RandomX blocks are identified by version number with specific bits set
+        const bool isRandomXBlock = (obj.nVersion & 0x20000000) == 0x20000000;
+        if (isRandomXBlock || (s.GetVersion() & SERIALIZE_ALPHA_RANDOMX)) {
+            READWRITE(obj.hashRandomX);
+        }
     }
 
     void SetNull() noexcept {
@@ -48,6 +57,7 @@ public:
         nTime = 0u;
         nBits = 0u;
         nNonce = 0u;
+        hashRandomX.SetNull();
     }
 
     bool IsNull() const noexcept { return nBits == 0; }

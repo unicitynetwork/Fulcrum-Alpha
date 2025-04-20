@@ -1069,7 +1069,13 @@ struct Storage::Pvt
 
     Pvt(const Pvt &) = delete;
 
-    constexpr int blockHeaderSize() { return BTC::GetBlockHeaderSize(); }
+    int blockHeaderSize() const { 
+    // IMPORTANT: Always use 112-byte headers for Alpha chain
+    Debug() << "ALWAYS using 112-byte headers for Alpha chain";
+    
+    // Return 112 bytes no matter what - since this is an Alpha-specific build
+    return BTC::GetBlockHeaderSize(true); // 112 bytes for Alpha chain
+}
 
     /* NOTE: If taking multiple locks, all locks should be taken in the order they are declared, to avoid deadlocks. */
 
@@ -2391,10 +2397,37 @@ void Storage::appendHeader(const Header &h, BlockHeight height)
     const auto targetHeight = p->headersFile->numRecords();
     if (UNLIKELY(height != targetHeight))
         throw InternalError(QString("Bad use of appendHeader -- expected height %1, got height %2").arg(targetHeight).arg(height));
+    
+    // The record size we're using for all headers (should be 112 bytes for Alpha chain)
+    const size_t recordSize = p->headersFile->recordSize();
+    
+    // SPECIAL CASE FOR ALPHA CHAIN: Always use 112-byte headers with zero padding 
+    // for standard 80-byte headers
+    QByteArray paddedHeader;
+    
+    // Create a new header with exactly the record size (112 bytes for Alpha)
+    paddedHeader.resize(int(recordSize));
+    paddedHeader.fill(0); // Fill with zeros
+    
+    // Copy the original header data (whether it's 80 or 112 bytes)
+    const int copySize = std::min(h.size(), paddedHeader.size());
+    std::memcpy(paddedHeader.data(), h.constData(), size_t(copySize));
+    
+    Debug() << "appendHeader: height=" << height 
+           << ", original header size=" << h.size() 
+           << ", record size=" << recordSize
+           << ", padded size=" << paddedHeader.size();
+    
+    // Now append the padded header
     QString err;
-    const auto res = p->headersFile->appendRecord(h, true, &err);
-    if (UNLIKELY(!err.isEmpty()))
+    const auto res = p->headersFile->appendRecord(paddedHeader, true, &err);
+    if (UNLIKELY(!err.isEmpty())) {
+        Debug() << "Failed to append header " << height << ": " << err 
+               << " - Original header size: " << h.size() 
+               << " - Padded header size: " << paddedHeader.size() 
+               << " - RecordFile record size: " << recordSize;
         throw DatabaseError(QString("Failed to append header %1: %2").arg(height).arg(err));
+    }
     else if (UNLIKELY(!res.has_value() || *res != height))
         throw DatabaseError(QString("Failed to append header %1: returned count is bad").arg(height));
 }

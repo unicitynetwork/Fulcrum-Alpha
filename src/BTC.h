@@ -45,7 +45,7 @@
 namespace BTC
 {
     /// Used by the Storage and Controller subsystem to figure out what coin we are on (BCH vs BTC vs LTC)
-    enum class Coin { Unknown = 0, BCH, BTC, LTC };
+    enum class Coin { Unknown = 0, BCH, BTC, LTC, ALPHA };
 
     QString coinToName(Coin);
     Coin coinFromName(const QString &);
@@ -68,22 +68,23 @@ namespace BTC
     /// and done in-place.
     template <typename BitcoinObject>
     QByteArray & Serialize(QByteArray &buf, const BitcoinObject &thing, int from_pos = -1, bool allowSegWit = false,
-                           bool allowMW = false)
+                           bool allowMW = false, bool allowAlphaRandomX = false)
     {
         if (from_pos < 0) from_pos = buf.size();
         int version = bitcoin::PROTOCOL_VERSION;
         if (allowSegWit) version |=  bitcoin::SERIALIZE_TRANSACTION_USE_WITNESS;
         if (allowMW) version |= bitcoin::SERIALIZE_TRANSACTION_USE_MWEB;
+        if (allowAlphaRandomX) version |= bitcoin::SERIALIZE_ALPHA_RANDOMX;
         bitcoin::GenericVectorWriter<QByteArray> vw(bitcoin::SER_NETWORK, version, buf, from_pos);
         thing.Serialize(vw);
         return buf;
     }
     /// Convenience for above -- serialize to a new QByteArray directly
     template <typename BitcoinObject>
-    QByteArray Serialize(const BitcoinObject &thing, bool allowSegWit = false, bool allowMW = false)
+    QByteArray Serialize(const BitcoinObject &thing, bool allowSegWit = false, bool allowMW = false, bool allowAlphaRandomX = false)
     {
         QByteArray ret;
-        Serialize(ret, thing, -1, allowSegWit, allowMW);
+        Serialize(ret, thing, -1, allowSegWit, allowMW, allowAlphaRandomX);
         return ret;
     }
     /// Deserialize to a pre-allocated bitcoin object such as bitcoin::CBlock, bitcoin::CBlockHeader,
@@ -93,12 +94,13 @@ namespace BTC
     /// (use the non-in-place specialization instead)
     requires (!std::is_same_v<std::remove_cvref_t<BitcoinObject>, bitcoin::CTransaction>)
     void Deserialize(BitcoinObject &thing, const QByteArray &bytes, int pos = 0, bool allowSegWit = false,
-                     bool allowMW = false, bool allowCashTokens = true, bool throwIfJunkAtEnd = false)
+                     bool allowMW = false, bool allowCashTokens = true, bool throwIfJunkAtEnd = false, bool allowAlphaRandomX = false)
     {
         int version = bitcoin::PROTOCOL_VERSION;
         if (allowSegWit) version |= bitcoin::SERIALIZE_TRANSACTION_USE_WITNESS;
         if (allowMW) version |= bitcoin::SERIALIZE_TRANSACTION_USE_MWEB;
         if (allowCashTokens) version |= bitcoin::SERIALIZE_TRANSACTION_USE_CASHTOKENS;
+        if (allowAlphaRandomX) version |= bitcoin::SERIALIZE_ALPHA_RANDOMX;
         bitcoin::GenericVectorReader<QByteArray> vr(bitcoin::SER_NETWORK, version, bytes, pos);
         thing.Unserialize(vr);
         if (throwIfJunkAtEnd && !vr.empty())
@@ -108,37 +110,54 @@ namespace BTC
     /// Convenience for above.  Create an instance of object and deserialize to it
     template <typename BitcoinObject>
     BitcoinObject Deserialize(const QByteArray &bytes, int pos = 0, bool allowSegWit = false, bool allowMW = false,
-                              bool allowCashTokens = true, bool noJunkAtEnd = false)
+                              bool allowCashTokens = true, bool noJunkAtEnd = false, bool allowAlphaRandomX = false)
     {
         BitcoinObject ret;
-        Deserialize(ret, bytes, pos, allowSegWit, allowMW, allowCashTokens, noJunkAtEnd);
+        Deserialize(ret, bytes, pos, allowSegWit, allowMW, allowCashTokens, noJunkAtEnd, allowAlphaRandomX);
         return ret;
     }
 
     template <typename BO>
     concept BlockOrTx = std::is_base_of_v<bitcoin::CBlock, std::decay_t<BO>>
                         || std::is_same_v<bitcoin::CTransaction, std::decay_t<BO>>
-                        || std::is_same_v<bitcoin::CMutableTransaction, std::decay_t<BO>>;
+                        || std::is_same_v<bitcoin::CMutableTransaction, std::decay_t<BO>>
+                        || std::is_same_v<bitcoin::CBlockHeader, std::decay_t<BO>>;
 
     /// Template specialization for CTransaction which has const fields and works a little differently
     template <> inline bitcoin::CTransaction Deserialize(const QByteArray &ba, int pos, bool allowSegWit, bool allowMW,
-                                                         bool allowCashTokens, bool noJunkAtEnd)
+                                                         bool allowCashTokens, bool noJunkAtEnd, bool allowAlphaRandomX)
     {
         // This *does* move the vectors from CMutableTransaction -> CTransaction
         return bitcoin::CTransaction{Deserialize<bitcoin::CMutableTransaction>(ba, pos, allowSegWit, allowMW,
-                                                                               allowCashTokens, noJunkAtEnd)};
+                                                                               allowCashTokens, noJunkAtEnd, allowAlphaRandomX)};
     }
 
     /// Convenience to deserialize segwit object (block or tx) (Core only)
     template <BlockOrTx BitcoinObject>
     BitcoinObject DeserializeSegWit(const QByteArray &ba, int pos = 0) {
-        return Deserialize<BitcoinObject>(ba, pos, /* segwit= */ true, /* mw= */ false, /* cashtokens= */false);
+        return Deserialize<BitcoinObject>(ba, pos, /* segwit= */ true, /* mw= */ false, /* cashtokens= */false, /* noJunkAtEnd= */false, /* alphaRandomX= */false);
     }
 
     /// Convenience to serialize segwit object (block or tx) (Core only)
     template <BlockOrTx BitcoinObject>
-    QByteArray SerializeSegWit(const BitcoinObject &bo, int pos = -1) {
-        return Serialize<BitcoinObject>(bo, pos, true, false);
+    QByteArray SerializeSegWit(const BitcoinObject &bo) {
+        QByteArray ret;
+        Serialize(ret, bo, -1, /*allowSegWit=*/true, /*allowMW=*/false, /*allowAlphaRandomX=*/false);
+        return ret;
+    }
+    
+    /// Convenience to deserialize Alpha RandomX object with extended header format (112 bytes)
+    template <BlockOrTx BitcoinObject>
+    BitcoinObject DeserializeAlphaRandomX(const QByteArray &ba, int pos = 0) {
+        return Deserialize<BitcoinObject>(ba, pos, /* segwit= */ true, /* mw= */ false, /* cashtokens= */false, /* noJunkAtEnd= */false, /* alphaRandomX= */true);
+    }
+
+    /// Convenience to serialize Alpha RandomX object with extended header format (112 bytes)
+    template <BlockOrTx BitcoinObject>
+    QByteArray SerializeAlphaRandomX(const BitcoinObject &bo) {
+        QByteArray ret;
+        Serialize(ret, bo, -1, /*allowSegWit=*/true, /*allowMW=*/false, /*allowAlphaRandomX=*/true);
+        return ret;
     }
 
     /// Used for scripthash_unspent db value and/or for TXOInfo inside utxoset db. May throw on deser failure or will
@@ -149,8 +168,11 @@ namespace BTC
     /// Appends prefix + token data to the end of byte stream `ba`. Will pre-reserve space first. May throw (unlikely).
     void SerializeTokenDataWithPrefix(QByteArray &ba, const bitcoin::token::OutputData *ptokenData);
 
-    /// Helper -- returns the size of a block header. Should always be 80. Update this if that changes.
-    constexpr int GetBlockHeaderSize() noexcept { return 80; }
+    /// Helper -- returns the size of a block header. 
+    /// Standard block header is 80 bytes. Alpha with RandomX extension is 112 bytes.
+    constexpr int GetBlockHeaderSize(bool isAlphaRandomX = false) noexcept { 
+        return isAlphaRandomX ? 112 : 80; 
+    }
 
     /// Returns the sha256 double hash (not reveresed -- little endian) of the input QByteArray. The results are copied
     /// once from the hasher into the returned QByteArray.  This is faster than obtaining a uint256 from bitcoin::Hash
@@ -204,7 +226,7 @@ namespace BTC
         QByteArray prev; // 80 byte header data or empty
         long prevHeight = -1;
 
-        bool checkInner(long height, const bitcoin::CBlockHeader &, QString *err);
+        bool checkInner(long height, const bitcoin::CBlockHeader &, QString *err, bool isAlphaRandomX = false);
     public:
         HeaderVerifier() = default;
         HeaderVerifier(unsigned fromHeight) : prevHeight(long(fromHeight)-1) {}
@@ -264,6 +286,8 @@ namespace BTC
         ScaleNet = TestNet+2, ///< does not match anything in the bitcoin world, just an enum value
         RegTestNet = TestNet+3, ///< does not match anything in the bitcoin world, just an enum value
         ChipNet = TestNet+4, ///< does not match anything in the bitcoin world, just an enum value
+        AlphaNet = 0xa1, ///< Alpha network magic byte
+        AlphaTestNet = 0xa2, ///< Alpha testnet magic byte
     };
 
     /// Given a Net, returns its name e.g. "main", "test", "regtest" (or "invalid" if parameter `net` is not valid).

@@ -13,6 +13,17 @@
 namespace bitcoin {
 
 uint256 CBlockHeader::GetHash() const {
+    // For Alpha chain after RandomX activation height, use the pre-computed hashRandomX field
+    // This is a hack and assumes that Fulcrum server operates in the same trust boundary as the node
+    // In a real implementation, we would need to check if:
+    // 1. We're on the Alpha chain
+    // 2. We're past the RandomX activation height
+    // But for simplicity, we'll just check if hashRandomX is non-null
+    if (!hashRandomX.IsNull()) {
+        return hashRandomX;
+    }
+    
+    // Default behavior - use standard double-SHA256
     return SerializeHash(*this);
 }
 

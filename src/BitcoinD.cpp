@@ -195,7 +195,7 @@ BitcoinD *BitcoinDMgr::getBitcoinD()
 
 namespace {
     struct BitcoinDVersionParseResult {
-        bool isBchd{}, isCore{}, isBU{}, isBCHN{}, isLTC{}, isFlowee{};
+        bool isBchd{}, isCore{}, isBU{}, isBCHN{}, isLTC{}, isFlowee{}, isAlpha{};
         Version version;
 
         constexpr BitcoinDVersionParseResult() noexcept = default;
@@ -228,6 +228,7 @@ namespace {
             isBCHN = subversion.startsWith("/Bitcoin Cash Node:");
             isLTC = subversion.startsWith("/LitecoinCore:");
             isFlowee = subversion.startsWith("/Flowee:");
+            isAlpha = subversion.startsWith("/Alpha:");
             // regular bitcoind, "version" is reliable and always the same format
             version = Version::BitcoinDCompact(val);
         }
@@ -279,8 +280,8 @@ void BitcoinDMgr::refreshBitcoinDNetworkInfo()
                 }(bitcoinDInfo.subversion, networkInfo);
                 // assign to shared object now from stack object BitcoinDVersionParseResult
                 std::tie(bitcoinDInfo.isBchd, bitcoinDInfo.isCore, bitcoinDInfo.isBU, bitcoinDInfo.isLTC,
-                         bitcoinDInfo.isFlowee, bitcoinDInfo.version)
-                    = std::tie(res.isBchd, res.isCore, res.isBU, res.isLTC, res.isFlowee, res.version);
+                         bitcoinDInfo.isFlowee, bitcoinDInfo.isAlpha, bitcoinDInfo.version)
+                    = std::tie(res.isBchd, res.isCore, res.isBU, res.isLTC, res.isFlowee, res.isAlpha, res.version);
                 bitcoinDInfo.relayFee = networkInfo.value("relayfee", 0.0).toDouble();
                 bitcoinDInfo.warnings = networkInfo.value("warnings", "").toString();
                 // set quirk flags: requires 0 arg `estimatefee`?
@@ -308,6 +309,7 @@ void BitcoinDMgr::refreshBitcoinDNetworkInfo()
             BTC::Coin coin = BTC::Coin::BCH; // default BCH if unknown (not segwit)
             if (res.isCore) coin = BTC::Coin::BTC; // segwit
             else if (res.isLTC) coin = BTC::Coin::LTC; // segwit
+            else if (res.isAlpha) coin = BTC::Coin::ALPHA; // Alpha chain
             emit coinDetected(coin);
             // next, be sure to set up the ping time appropriately for bchd vs bitcoind
             resetPingTimers(int(res.isBchd ? PingTimes::BCHD : PingTimes::Normal));
@@ -987,6 +989,7 @@ QVariantMap BitcoinDInfo::toVariantMap() const
     ret["isZeroArgEstimateFee"] = isZeroArgEstimateFee;
     ret["isBchd"] = isBchd;
     ret["isCore"] = isCore;
+    ret["isAlpha"] = isAlpha;
     ret["lacksGetZmqNotifications"] = lacksGetZmqNotifications;
     ret["hasDSProofRPC"] = hasDSProofRPC;
     QVariantList zmqs;

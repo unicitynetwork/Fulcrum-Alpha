@@ -54,6 +54,7 @@ struct BitcoinDInfo {
     bool isLTC = false; ///< true if we are actually connected to /LitecoinCore.. node (Litecoin)
     bool isBU = false; ///< true if subversion string starts with "/BCH Unlimited:"
     bool isFlowee = false; ///< true if subversion string starts with "/Flowee"
+    bool isAlpha = false; ///< true if subversion string starts with "/Alpha:"
     bool lacksGetZmqNotifications = false; ///< true if bchd or BU < 1.9.1.0, or if we got an RPC error the last time we queried
     bool hasDSProofRPC = false; ///< true if the RPC query to `getdsprooflist` didn't return an error.
 

@@ -42,6 +42,8 @@ static constexpr int SERIALIZE_TRANSACTION_USE_WITNESS = 0x40000000;
 static constexpr int SERIALIZE_TRANSACTION_USE_MWEB = 0x20000000;
 // Added by Calin to optionally enable/disbale token ser/deser (BCH-specific)
 static constexpr int SERIALIZE_TRANSACTION_USE_CASHTOKENS = 0x10000000;
+// Added for Alpha chain to serialize the additional hashRandomX field
+static constexpr int SERIALIZE_ALPHA_RANDOMX = 0x08000000;
 
 static_assert (sizeof(int) >= 4);
 

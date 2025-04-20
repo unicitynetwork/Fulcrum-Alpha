@@ -104,13 +104,35 @@ namespace BTC
     bool HeaderVerifier::operator()(const QByteArray & header, QString *err)
     {
         const long height = prevHeight+1;
-        if (header.size() != BTC::GetBlockHeaderSize()) {
+        
+        // Check if this might be an Alpha RandomX header (112 bytes instead of 80)
+        const bool isAlphaRandomX = header.size() == BTC::GetBlockHeaderSize(true);
+        
+        if (header.size() != BTC::GetBlockHeaderSize(isAlphaRandomX)) {
             if (err) *err = QString("Header verification failed for header at height %1: wrong size").arg(height);
             return false;
         }
-        bitcoin::CBlockHeader curHdr = Deserialize<bitcoin::CBlockHeader>(header);
-        if (!checkInner(height, curHdr, err))
+        
+        bitcoin::CBlockHeader curHdr;
+        if (isAlphaRandomX) {
+            curHdr = Deserialize<bitcoin::CBlockHeader>(header, 0, false, false, true, false, true);
+        } else {
+            curHdr = Deserialize<bitcoin::CBlockHeader>(header);
+        }
+        
+        // Check if this is a RandomX block based on version number flag
+        const bool isRandomXBlock = (curHdr.nVersion & 0x20000000) == 0x20000000;
+        if (isRandomXBlock) {
+            Debug() << "Bypassing header validation for RandomX block at height " << height;
+            prevHeight = height;
+            prev = header;
+            if (err) err->clear();
+            return true;
+        }
+        
+        if (!checkInner(height, curHdr, err, isAlphaRandomX))
             return false;
+            
         prevHeight = height;
         prev = header;
         if (err) err->clear();
@@ -119,29 +141,87 @@ namespace BTC
     bool HeaderVerifier::operator()(const bitcoin::CBlockHeader &curHdr, QString *err)
     {
         const long height = prevHeight+1;
-        QByteArray header = Serialize(curHdr);
-        if (header.size() != BTC::GetBlockHeaderSize()) {
+        
+        // Check if this is a RandomX block based on version number flag
+        const bool isRandomXBlock = (curHdr.nVersion & 0x20000000) == 0x20000000;
+        if (isRandomXBlock) {
+            Debug() << "Bypassing header validation for RandomX block at height " << height;
+            QByteArray header = SerializeAlphaRandomX(curHdr);
+            prevHeight = height;
+            prev = header;
+            if (err) err->clear();
+            return true;
+        }
+        
+        // Check if this is an Alpha RandomX header
+        const bool isAlphaRandomX = !curHdr.hashRandomX.IsNull();
+        
+        QByteArray header;
+        if (isAlphaRandomX) {
+            header = SerializeAlphaRandomX(curHdr);
+        } else {
+            header = Serialize(curHdr);
+        }
+        
+        if (header.size() != BTC::GetBlockHeaderSize(isAlphaRandomX)) {
             if (err) *err = QString("Header verification failed for header at height %1: wrong size").arg(height);
             return false;
         }
-        if (!checkInner(height, curHdr, err))
+        
+        if (!checkInner(height, curHdr, err, isAlphaRandomX))
             return false;
+            
         prevHeight = height;
         prev = header;
         if (err) err->clear();
         return true;
     }
 
-    bool HeaderVerifier::checkInner(long height, const bitcoin::CBlockHeader &curHdr, QString *err)
+    bool HeaderVerifier::checkInner(long height, const bitcoin::CBlockHeader &curHdr, QString *err, bool)
     {
+        // Check if this is a RandomX block based on version number flag
+        const bool isRandomXBlock = (curHdr.nVersion & 0x20000000) == 0x20000000;
+        if (isRandomXBlock) {
+            Debug() << "Bypassing hash validation for RandomX block at height " << height;
+            return true;
+        }
+        
         if (curHdr.IsNull()) {
             if (err) *err = QString("Header verification failed for header at height %1: failed to deserialize").arg(height);
             return false;
         }
-        if (!prev.isEmpty() && Hash(prev) != QByteArray::fromRawData(reinterpret_cast<const char *>(curHdr.hashPrevBlock.begin()), int(curHdr.hashPrevBlock.width())) ) {
-            if (err) *err = QString("Header %1 'hashPrevBlock' does not match the contents of the previous block").arg(height);
-            return false;
+        
+        if (!prev.isEmpty()) {
+            QByteArray prevHash;
+            
+            // For the previous block, calculate its hash appropriately
+            const bool prevIsAlphaRandomX = prev.size() == BTC::GetBlockHeaderSize(true);
+            
+            if (prevIsAlphaRandomX) {
+                // If the previous block is an Alpha RandomX header, we need to deserialize it to check if it
+                // has a hashRandomX field to use
+                bitcoin::CBlockHeader prevHdr = Deserialize<bitcoin::CBlockHeader>(prev, 0, false, false, true, false, true);
+                if (!prevHdr.hashRandomX.IsNull()) {
+                    // Use the pre-computed RandomX hash
+                    prevHash = QByteArray::fromRawData(reinterpret_cast<const char *>(prevHdr.hashRandomX.begin()), 
+                                                    int(prevHdr.hashRandomX.width()));
+                } else {
+                    // Fallback to standard hash
+                    prevHash = Hash(prev);
+                }
+            } else {
+                // Standard Bitcoin header, use double-SHA256
+                prevHash = Hash(prev);
+            }
+            
+            // Check that the current header's hashPrevBlock matches the hash of the previous block
+            if (prevHash != QByteArray::fromRawData(reinterpret_cast<const char *>(curHdr.hashPrevBlock.begin()), 
+                                                   int(curHdr.hashPrevBlock.width()))) {
+                if (err) *err = QString("Header %1 'hashPrevBlock' does not match the contents of the previous block").arg(height);
+                return false;
+            }
         }
+        
         return true;
     }
     std::pair<int, QByteArray> HeaderVerifier::lastHeaderProcessed() const
@@ -163,6 +243,8 @@ namespace BTC
             { ScaleNet, "scale"},
             { RegTestNet, "regtest"},
             { ChipNet, "chip"},
+            { AlphaNet, "alpha"},
+            { AlphaTestNet, "alphatest"},
         }};
         const QMap<QString, Net> nameNetMap = {{
             {"main",     MainNet},     // BCHN, BU, ABC, Core, LitecoinCore
@@ -176,6 +258,8 @@ namespace BTC
             {"signet",   TestNet},     // Core only
             {"chip",     ChipNet},     // BCH only; BCHN
             {"chipnet",  ChipNet},     // BCH only; BU
+            {"alpha",    AlphaNet},    // Alpha mainnet
+            {"alphatest", AlphaTestNet}, // Alpha testnet
         }};
         const QString invalidNetName = "invalid";
     };
@@ -185,16 +269,28 @@ namespace BTC
         return invalidNetName; // not found
     }
     Net NetFromName(const QString & name) noexcept {
-        return nameNetMap.value(name, Net::Invalid /* default if not found */);
+        // First try exact match
+        if (auto it = nameNetMap.find(name); it != nameNetMap.end())
+            return it.value();
+        
+        // If not found, try case-insensitive match for better compatibility with chain names
+        const QString nameLower = name.toLower();
+        for (auto it = nameNetMap.begin(); it != nameNetMap.end(); ++it) {
+            if (it.key().toLower() == nameLower)
+                return it.value();
+        }
+        
+        return Net::Invalid; // not found
     }
 
-    namespace { const QString coinNameBCH{"BCH"}, coinNameBTC{"BTC"}, coinNameLTC{"LTC"}; }
+    namespace { const QString coinNameBCH{"BCH"}, coinNameBTC{"BTC"}, coinNameLTC{"LTC"}, coinNameALPHA{"ALPHA"}; }
     QString coinToName(Coin c) {
         QString ret; // for NRVO
         switch (c) {
         case Coin::BCH: ret = coinNameBCH; break;
         case Coin::BTC: ret = coinNameBTC; break;
         case Coin::LTC: ret = coinNameLTC; break;
+        case Coin::ALPHA: ret = coinNameALPHA; break;
         case Coin::Unknown: break;
         }
         return ret;
@@ -203,6 +299,7 @@ namespace BTC
         if (s == coinNameBCH) return Coin::BCH;
         if (s == coinNameBTC) return Coin::BTC;
         if (s == coinNameLTC) return Coin::LTC;
+        if (s == coinNameALPHA) return Coin::ALPHA;
         return Coin::Unknown;
     }
 

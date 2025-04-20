@@ -347,6 +347,13 @@ void Controller::on_coinDetected(const BTC::Coin detectedtype)
                        "At the present time, to use BTC, bitcoind must be Bitcoin Core v0.17.0 or above.\n"
                        "Please either connect to the appropriate bitcoind for this database, or delete\n"
                        "the datadir and resynch.\n";
+        } else if (detectedtype == BTC::Coin::ALPHA) {
+            // If we're switching to ALPHA, allow it after warning the user
+            Warning() << "Switching from " << BTC::coinToName(ourtype) << " to " << BTC::coinToName(detectedtype) << " - resyncing database";
+            coinType = detectedtype;
+            const auto coinName = BTC::coinToName(detectedtype);
+            storage->setCoin(coinName); // thread-safe call to storage, ok to do here.
+            bitcoin::SetCurrencyUnit(coinName.toStdString());
         } else {
             // Generic message for LTC/BCH/BTC mismatch.
             Fatal() << "Unexpected coin combination: ourtype=" << BTC::coinToName(ourtype)
@@ -496,7 +503,7 @@ struct DownloadBlocksTask : CtlTask
     int q_ct = 0;
     const int max_q; // todo: tune this, for now it is numBitcoinDClients + 1
 
-    static constexpr int HEADER_SIZE = BTC::GetBlockHeaderSize();
+    // We use a dynamic header size based on coin type, see BTC::GetBlockHeaderSize()
 
     std::atomic<size_t> nTx = 0, nIns = 0, nOuts = 0;
 
@@ -574,13 +581,43 @@ void DownloadBlocksTask::do_get(unsigned int bnum)
             submitRequest("getblock", {var, false}, [this, bnum, hash](const RPC::Message & resp){
                 try {
                     auto rawblock = Util::ParseHexFast(resp.result().toByteArray());
-                    const auto header = rawblock.left(HEADER_SIZE); // we need a deep copy of this anyway so might as well take it now.
+                    // Check if this might be a RandomX block by looking at the version field
+                    // RandomX blocks have the 0x20000000 bit set in the version
+                    const int basicHeaderSize = BTC::GetBlockHeaderSize(false); // 80 bytes
+                    const auto basicHeader = rawblock.left(basicHeaderSize);
+                    
+                    // Extract version from the first 4 bytes of the header (little-endian)
+                    uint32_t version = 0;
+                    if (basicHeader.size() >= 4) {
+                        version = *(reinterpret_cast<const uint32_t*>(basicHeader.constData()));
+                    }
+                    
+                    // Determine if this is a RandomX block based on version number
+                    const bool isRandomXBlock = (version & 0x20000000) == 0x20000000;
+                    const int headerSize = isRandomXBlock ? BTC::GetBlockHeaderSize(true) : BTC::GetBlockHeaderSize(false);
+                    
+                    // Get the appropriate header based on whether this is a RandomX block
+                    const auto header = rawblock.left(headerSize); // we need a deep copy of this anyway so might as well take it now.
+                    
                     QByteArray chkHash;
-                    if (bool sizeOk = header.length() == HEADER_SIZE; sizeOk && (chkHash = BTC::HashRev(header)) == hash) {
+                    // Skip hash validation for RandomX blocks (version bit 0x20000000 set)
+                    if (bool sizeOk = header.length() == headerSize; 
+                        sizeOk && (isRandomXBlock || (chkHash = BTC::HashRev(header)) == hash)) {
                         PreProcessedBlockPtr maybe_ppb; // either this is filled
                         Controller::RpaOnlyModeDataPtr maybe_rpaOnlyMode;  // or this is.. but not both!
                         try {
-                            const auto cblock = BTC::Deserialize<bitcoin::CBlock>(rawblock, 0, allowSegWit, allowMimble, allowCashTokens, allowMimble /* throw if junk at end if Litecoin (catch deser. bugs) */);
+                            // Deserialize the block - our deserialization logic now handles RandomX blocks automatically
+                            // based on the version number in the block header
+                            bitcoin::CBlock cblock;
+                            try {
+                                // Use universal deserialization that now handles both standard and RandomX blocks
+                                // based on the version field in the header
+                                cblock = BTC::Deserialize<bitcoin::CBlock>(rawblock, 0, allowSegWit, allowMimble, allowCashTokens, false);
+                                
+                            } catch (const std::exception &e) {
+                                Fatal() << "Failed to deserialize block at height " << bnum << ": " << e.what();
+                                throw; // Re-throw to be handled by caller
+                            }
                             {
                                 VarDLTaskResult var = process_block_guts(bnum, rawblock, cblock);
                                 std::visit(
