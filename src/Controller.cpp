@@ -581,26 +581,16 @@ void DownloadBlocksTask::do_get(unsigned int bnum)
             submitRequest("getblock", {var, false}, [this, bnum, hash](const RPC::Message & resp){
                 try {
                     auto rawblock = Util::ParseHexFast(resp.result().toByteArray());
-                    // Check if this might be a RandomX block by looking at the version field
-                    // RandomX blocks have the 0x20000000 bit set in the version
-                    const int basicHeaderSize = BTC::GetBlockHeaderSize(false); // 80 bytes
-                    const auto basicHeader = rawblock.left(basicHeaderSize);
-                    
-                    // Extract version from the first 4 bytes of the header (little-endian)
-                    uint32_t version = 0;
-                    if (basicHeader.size() >= 4) {
-                        version = *(reinterpret_cast<const uint32_t*>(basicHeader.constData()));
-                    }
-                    
-                    // Determine if this is a RandomX block based on version number
-                    const bool isRandomXBlock = (version & 0x20000000) == 0x20000000;
+                    // Check if this might be a RandomX block based on block height
+                    // RandomX blocks are all blocks at or after the activation height
+                    const bool isRandomXBlock = BTC::IsRandomXBlock(bnum);
                     const int headerSize = isRandomXBlock ? BTC::GetBlockHeaderSize(true) : BTC::GetBlockHeaderSize(false);
                     
                     // Get the appropriate header based on whether this is a RandomX block
                     const auto header = rawblock.left(headerSize); // we need a deep copy of this anyway so might as well take it now.
                     
                     QByteArray chkHash;
-                    // Skip hash validation for RandomX blocks (version bit 0x20000000 set)
+                    // Skip hash validation for RandomX blocks (after activation height)
                     if (bool sizeOk = header.length() == headerSize; 
                         sizeOk && (isRandomXBlock || (chkHash = BTC::HashRev(header)) == hash)) {
                         PreProcessedBlockPtr maybe_ppb; // either this is filled

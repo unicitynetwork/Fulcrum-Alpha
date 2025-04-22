@@ -105,23 +105,49 @@ namespace BTC
     {
         const long height = prevHeight+1;
         
-        // Check if this might be an Alpha RandomX header (112 bytes instead of 80)
-        const bool isAlphaRandomX = header.size() == BTC::GetBlockHeaderSize(true);
+        // Improved logging for diagnosis of RandomX transition issues
+        if (height >= ALPHA_RANDOMX_ACTIVATION_HEIGHT - 1 && height <= ALPHA_RANDOMX_ACTIVATION_HEIGHT + 1) {
+            Debug() << "Processing header at height " << height << " (size: " << header.size() 
+                    << ") - " << (IsRandomXBlock(height) ? "RandomX block" : "Standard block");
+        }
         
-        if (header.size() != BTC::GetBlockHeaderSize(isAlphaRandomX)) {
-            if (err) *err = QString("Header verification failed for header at height %1: wrong size").arg(height);
+        // Determine if this is an Alpha RandomX header based solely on height
+        const bool isAlphaRandomX = IsRandomXBlock(height);
+        
+        // Since all headers are stored as fixed-size records in the database, we need to accept
+        // this size for all headers, regardless of whether they're RandomX blocks or not
+        if (header.size() != FIXED_HEADER_RECORD_SIZE) {
+            if (err) *err = QString("Header verification failed for header at height %1: wrong size (expected %2 bytes, got %3)")
+                .arg(height).arg(FIXED_HEADER_RECORD_SIZE).arg(header.size());
             return false;
         }
         
         bitcoin::CBlockHeader curHdr;
-        if (isAlphaRandomX) {
-            curHdr = Deserialize<bitcoin::CBlockHeader>(header, 0, false, false, true, false, true);
-        } else {
-            curHdr = Deserialize<bitcoin::CBlockHeader>(header);
+        // Enhanced logging for early blocks
+        /*
+        if (height < 5) {
+            Debug() << "Deserializing header at height " << height << " (size: " << header.size() << " bytes)";
+            Debug() << "Header format: " << (isAlphaRandomX ? "Alpha RandomX (112 bytes)" : "Standard (80 bytes)");
+            Debug() << "First 10 bytes: " << Util::ToHexFast(header.left(10));
         }
+        */
         
-        // Check if this is a RandomX block based on version number flag
-        const bool isRandomXBlock = (curHdr.nVersion & 0x20000000) == 0x20000000;
+        // For all headers, use standard deserialization
+        // Detection of RandomX now happens via the version bit (0x20000000)
+        curHdr = Deserialize<bitcoin::CBlockHeader>(header);
+        
+        // More logging for understanding header fields
+        /*
+        if (height < 5) {
+            Debug() << "Header fields at height " << height << ":";
+            Debug() << "  Version: " << curHdr.nVersion;
+            Debug() << "  PrevBlock: " << curHdr.hashPrevBlock.ToString().c_str();
+            Debug() << "  Time: " << curHdr.nTime;
+        }
+        */
+        
+        // Check if this is a RandomX block based on height
+        const bool isRandomXBlock = IsRandomXBlock(height);
         if (isRandomXBlock) {
             Debug() << "Bypassing header validation for RandomX block at height " << height;
             prevHeight = height;
@@ -142,29 +168,38 @@ namespace BTC
     {
         const long height = prevHeight+1;
         
-        // Check if this is a RandomX block based on version number flag
-        const bool isRandomXBlock = (curHdr.nVersion & 0x20000000) == 0x20000000;
+        // Check if this is a RandomX block based on height
+        const bool isRandomXBlock = IsRandomXBlock(height);
         if (isRandomXBlock) {
             Debug() << "Bypassing header validation for RandomX block at height " << height;
-            QByteArray header = SerializeAlphaRandomX(curHdr);
+            QByteArray header = Serialize(curHdr);
             prevHeight = height;
             prev = header;
             if (err) err->clear();
             return true;
         }
         
-        // Check if this is an Alpha RandomX header
-        const bool isAlphaRandomX = !curHdr.hashRandomX.IsNull();
+        // Determine if this is an Alpha RandomX header based solely on height
+        const bool isAlphaRandomX = IsRandomXBlock(height);
         
-        QByteArray header;
-        if (isAlphaRandomX) {
-            header = SerializeAlphaRandomX(curHdr);
-        } else {
-            header = Serialize(curHdr);
+        // Verify that RandomX headers have hashRandomX set and non-RandomX headers don't
+        if (isAlphaRandomX && curHdr.hashRandomX.IsNull()) {
+            if (err) *err = QString("RandomX block at height %1 is missing hashRandomX field").arg(height);
+            return false;
+        } else if (!isAlphaRandomX && !curHdr.hashRandomX.IsNull()) {
+            if (err) *err = QString("Non-RandomX block at height %1 has unexpected hashRandomX field").arg(height);
+            return false;
         }
         
-        if (header.size() != BTC::GetBlockHeaderSize(isAlphaRandomX)) {
-            if (err) *err = QString("Header verification failed for header at height %1: wrong size").arg(height);
+        // Serialize the header - the serialization will automatically include
+        // the hashRandomX field if the version bit is set
+        QByteArray header = Serialize(curHdr);
+        
+        // Since all headers are stored as fixed-size records in the database, we need to accept
+        // this size for all headers, regardless of whether they're RandomX blocks or not
+        if (header.size() != FIXED_HEADER_RECORD_SIZE) {
+            if (err) *err = QString("Header verification failed for header at height %1: wrong size (expected %2 bytes, got %3)")
+                .arg(height).arg(FIXED_HEADER_RECORD_SIZE).arg(header.size());
             return false;
         }
         
@@ -179,8 +214,8 @@ namespace BTC
 
     bool HeaderVerifier::checkInner(long height, const bitcoin::CBlockHeader &curHdr, QString *err, bool)
     {
-        // Check if this is a RandomX block based on version number flag
-        const bool isRandomXBlock = (curHdr.nVersion & 0x20000000) == 0x20000000;
+        // Check if this is a RandomX block based on height
+        const bool isRandomXBlock = IsRandomXBlock(height);
         if (isRandomXBlock) {
             Debug() << "Bypassing hash validation for RandomX block at height " << height;
             return true;
@@ -194,24 +229,66 @@ namespace BTC
         if (!prev.isEmpty()) {
             QByteArray prevHash;
             
-            // For the previous block, calculate its hash appropriately
-            const bool prevIsAlphaRandomX = prev.size() == BTC::GetBlockHeaderSize(true);
+            // For the previous block, determine how to calculate its hash
             
+            const bool prevIsRandomX = IsRandomXBlock(prevHeight);
+            // For clarity in code below
+            const bool prevIsAlphaRandomX = prevIsRandomX;
+            
+            // Since all headers are stored as fixed-size records in the database, we need to accept
+            // this size for all headers, regardless of whether they're RandomX blocks or not
+            if (prev.size() != FIXED_HEADER_RECORD_SIZE) {
+                if (err) *err = QString("Invalid header size for block %1: expected %2 bytes, got %3")
+                    .arg(prevHeight).arg(FIXED_HEADER_RECORD_SIZE).arg(prev.size());
+                return false;
+            }
+            
+            /* 
+             * IMPORTANT: Handling the transition between standard blocks and RandomX blocks
+             * 
+             * There are several cases to consider:
+             * 1. Previous block is before activation height (standard header)
+             *    - Use standard double-SHA256 hash
+             * 
+             * 2. Previous block is after activation height (RandomX header)
+             *    - If hashRandomX is set, use it directly (most efficient)
+             *    - If hashRandomX is not set, throw an error (malformed header)
+             * 
+             * 3. We're at the transition point (current block is the first RandomX block)
+             *    - Previous block must be verified using standard double-SHA256
+             *    - Current block will bypass validation (due to the isRandomXBlock check above)
+             */
             if (prevIsAlphaRandomX) {
-                // If the previous block is an Alpha RandomX header, we need to deserialize it to check if it
-                // has a hashRandomX field to use
-                bitcoin::CBlockHeader prevHdr = Deserialize<bitcoin::CBlockHeader>(prev, 0, false, false, true, false, true);
+                // If the previous block is an Alpha RandomX header, check if it has a hashRandomX field
+                bitcoin::CBlockHeader prevHdr = Deserialize<bitcoin::CBlockHeader>(prev);
                 if (!prevHdr.hashRandomX.IsNull()) {
-                    // Use the pre-computed RandomX hash
+                    // Use the pre-computed RandomX hash stored in the header
                     prevHash = QByteArray::fromRawData(reinterpret_cast<const char *>(prevHdr.hashRandomX.begin()), 
                                                     int(prevHdr.hashRandomX.width()));
+                } else if (prevIsRandomX) {
+                    // For post-activation blocks, hashRandomX should always be set
+                    // If we get here, it means there's an error in the header format
+                    if (err) *err = QString("RandomX block at height %1 is missing hashRandomX field").arg(prevHeight);
+                    return false;
                 } else {
-                    // Fallback to standard hash
-                    prevHash = Hash(prev);
+                    // For standard block hashing, always use just the first 80 bytes
+                    prevHash = Hash(prev.left(80));
                 }
             } else {
-                // Standard Bitcoin header, use double-SHA256
-                prevHash = Hash(prev);
+                // For standard block hashing, always use just the first 80 bytes
+                prevHash = Hash(prev.left(80));
+            }
+            
+            // Enhanced diagnostic logging for early blocks (height < 10)
+            if (height < 10) {
+                QString prevHashHex = Util::ToHexFast(prevHash).toLower();
+                QString curPrevHashHex = curHdr.hashPrevBlock.ToString().c_str();
+                
+                Debug() << "Header verification for height " << height << ":";
+                Debug() << "  Previous block hash (calculated): " << prevHashHex;
+                Debug() << "  hashPrevBlock in current header:  " << curPrevHashHex;
+                Debug() << "  Previous header size: " << prev.size() << " bytes";
+                Debug() << "  Previous is RandomX: " << (prevIsRandomX ? "Yes" : "No");
             }
             
             // Check that the current header's hashPrevBlock matches the hash of the previous block

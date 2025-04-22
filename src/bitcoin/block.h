@@ -42,10 +42,11 @@ public:
         READWRITE(obj.nBits);
         READWRITE(obj.nNonce);
         
-        // Alpha extension - only serialize hashRandomX for Alpha chain
-        // RandomX blocks are identified by version number with specific bits set
+        // Alpha extension - include hashRandomX field for RandomX blocks
+        // RandomX blocks are identified by the version bit 0x20000000
+        // This bit is set on all blocks from height ALPHA_RANDOMX_ACTIVATION_HEIGHT onwards
         const bool isRandomXBlock = (obj.nVersion & 0x20000000) == 0x20000000;
-        if (isRandomXBlock || (s.GetVersion() & SERIALIZE_ALPHA_RANDOMX)) {
+        if (isRandomXBlock) {
             READWRITE(obj.hashRandomX);
         }
     }

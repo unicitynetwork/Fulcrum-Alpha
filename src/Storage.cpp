@@ -1069,13 +1069,27 @@ struct Storage::Pvt
 
     Pvt(const Pvt &) = delete;
 
-    int blockHeaderSize() const { 
-    // IMPORTANT: Always use 112-byte headers for Alpha chain
-    Debug() << "ALWAYS using 112-byte headers for Alpha chain";
-    
-    // Return 112 bytes no matter what - since this is an Alpha-specific build
-    return BTC::GetBlockHeaderSize(true); // 112 bytes for Alpha chain
-}
+    int blockHeaderSize(int height = -1) const {
+        // For Alpha chain, use 112-byte headers after the RandomX activation height
+        if (height >= 0) {
+            // If we know the height, we can be precise
+            bool isAfterRandomXActivation = BTC::IsRandomXBlock(height);
+            int size = BTC::GetBlockHeaderSize(isAfterRandomXActivation);
+            
+            // Extra logging for heights around the activation point
+            if (height >= BTC::ALPHA_RANDOMX_ACTIVATION_HEIGHT - 10 && height <= BTC::ALPHA_RANDOMX_ACTIVATION_HEIGHT + 10) {
+                Debug() << "Block header size for height " << height << ": " << size << " bytes "
+                        << (isAfterRandomXActivation ? "(RandomX header)" : "(Standard header)");
+            }
+            
+            return size;
+        } else {
+            // For Alpha builds, we need to be able to handle both header sizes
+            // When height is unknown, use the larger size for safety
+            Debug() << "Using 112-byte headers as a safe default (height unknown)";
+            return BTC::GetBlockHeaderSize(true);
+        }
+    }
 
     /* NOTE: If taking multiple locks, all locks should be taken in the order they are declared, to avoid deadlocks. */
 
@@ -2496,7 +2510,12 @@ auto Storage::headersFromHeight(BlockHeight height, unsigned count, QString *err
 void Storage::loadCheckHeadersInDB()
 {
     assert(p->blockHeaderSize() > 0);
-    p->headersFile = std::make_unique<RecordFile>(options->datadir + QDir::separator() + "headers", size_t(p->blockHeaderSize()), 0x00f026a1); // may throw
+    // Use the larger 112-byte header size for the file to handle both formats
+    // This ensures we can read all headers correctly regardless of format
+    p->headersFile = std::make_unique<RecordFile>(options->datadir + QDir::separator() + "headers", 
+                                                 size_t(BTC::GetBlockHeaderSize(true)), // Always use 112-byte records
+                                                 0x00f026a1); // may throw
+    Debug() << "Initialized headers file with record size: " << p->headersFile->recordSize() << " bytes";
 
     Log() << "Verifying headers ...";
     uint32_t num = unsigned(p->headersFile->numRecords());
@@ -2510,22 +2529,61 @@ void Storage::loadCheckHeadersInDB()
         // verify headers: hashPrevBlock must match what we actually read from db
         if (num) {
             Debug() << "Verifying " << num << " " << Util::Pluralize("header", num) << " ...";
+            
+            // Additional logging for Alpha chain at RandomX transition height
+            if (num >= BTC::ALPHA_RANDOMX_ACTIVATION_HEIGHT) {
+                Debug() << "Header verification includes RandomX activation height " << BTC::ALPHA_RANDOMX_ACTIVATION_HEIGHT;
+                Debug() << "Header file record size: " << p->headersFile->recordSize() << " bytes";
+            }
+            
             QString err;
             hVec = headersFromHeight_nolock_nocheck(0, num, &err);
             if (!err.isEmpty() || hVec.size() != num)
                 throw DatabaseFormatError(QString("%1. Possible databaase corruption. Delete the datadir and resynch.").arg(err.isEmpty() ? "Could not read all headers" : err));
 
             auto [verif, lock] = headerVerifier();
-            // set genesis hash
-            p->genesisHash = BTC::HashRev(hVec.front());
+            // set genesis hash - for all coins, only hash the first 80 bytes of the header
+            p->genesisHash = BTC::HashRev(hVec.front().left(80));
 
             err.clear();
             // read db
             for (uint32_t i = 0; i < num; ++i) {
                 auto & bytes = hVec[i];
+    
+                /*
+                // Add detailed logging for early blocks
+                if (i < 5) {
+                    Debug() << "Header " << i << " size: " << bytes.size() << " bytes";
+                    Debug() << "Header " << i << " raw data (hex): " << Util::ToHexFast(bytes);
+                    
+                    // Calculate the raw hash to see what's happening
+                    QByteArray rawHash = BTC::Hash(bytes.left(80)); // Standard header size
+                    Debug() << "  Raw 80-byte hash: " << Util::ToHexFast(rawHash);
+                    
+                    // Calculate hash with 112 bytes
+                    QByteArray fullHash = BTC::Hash(bytes);
+                    Debug() << "  Full 112-byte hash: " << Util::ToHexFast(fullHash);
+                    
+                    // Try to deserialize it to see what we're working with
+                    try {
+                        auto bHeader = BTC::Deserialize<bitcoin::CBlockHeader>(bytes, 0, false, false, true, false, true);
+                        Debug() << "  Version: " << bHeader.nVersion;
+                        Debug() << "  Time: " << bHeader.nTime;
+                        Debug() << "  hashPrevBlock: " << bHeader.hashPrevBlock.ToString().c_str();
+                        if (!bHeader.hashRandomX.IsNull()) {
+                            Debug() << "  hashRandomX: " << bHeader.hashRandomX.ToString().c_str();
+                        }
+                    } catch (const std::exception& e) {
+                        Debug() << "  Failed to deserialize header: " << e.what();
+                    }
+                }
+                */
+                
                 if (!verif(bytes, &err))
                     throw DatabaseFormatError(QString("%1. Possible databaase corruption. Delete the datadir and resynch.").arg(err));
-                bytes = BTC::Hash(bytes); // replace the header in the vector with its hash because it will be needed below...
+                
+                // Only hash the first 80 bytes for standard headers - consistent with other hash calculations
+                bytes = BTC::Hash(bytes.left(80)); // replace the header in the vector with its hash because it will be needed below...
             }
         }
     }
