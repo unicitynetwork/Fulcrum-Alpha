@@ -114,12 +114,18 @@ namespace BTC
         // Determine if this is an Alpha RandomX header based solely on height
         const bool isAlphaRandomX = IsRandomXBlock(height);
         
-        // Since all headers are stored as fixed-size records in the database, we need to accept
-        // this size for all headers, regardless of whether they're RandomX blocks or not
-        if (header.size() != FIXED_HEADER_RECORD_SIZE) {
-            if (err) *err = QString("Header verification failed for header at height %1: wrong size (expected %2 bytes, got %3)")
+        // Accept both 80-byte (standard) and 112-byte (padded) headers for verification
+        if (header.size() != FIXED_HEADER_RECORD_SIZE && header.size() != 80) {
+            if (err) *err = QString("Header verification failed for header at height %1: wrong size (expected %2 or 80 bytes, got %3)")
                 .arg(height).arg(FIXED_HEADER_RECORD_SIZE).arg(header.size());
             return false;
+        }
+        
+        // Add debug logging for the first few blocks to help diagnose issues
+        if (height < 10) {
+            Debug() << "QByteArray header verification at height " << height 
+                   << ": header size=" << header.size() 
+                   << ", isRandomX=" << (isAlphaRandomX ? "true" : "false");
         }
         
         bitcoin::CBlockHeader curHdr;
@@ -195,10 +201,18 @@ namespace BTC
         // the hashRandomX field if the version bit is set
         QByteArray header = Serialize(curHdr);
         
-        // Since all headers are stored as fixed-size records in the database, we need to accept
-        // this size for all headers, regardless of whether they're RandomX blocks or not
-        if (header.size() != FIXED_HEADER_RECORD_SIZE) {
-            if (err) *err = QString("Header verification failed for header at height %1: wrong size (expected %2 bytes, got %3)")
+        // For CBlockHeader serialization, recognize that standard blocks will be 80 bytes,
+        // while RandomX blocks will be 112 bytes
+        if (height < 10) {
+            Debug() << "CBlockHeader serialization at height " << height 
+                   << ": header size=" << header.size() 
+                   << ", isRandomX=" << (isRandomXBlock ? "true" : "false")
+                   << ", hasRandomXField=" << (!curHdr.hashRandomX.IsNull() ? "true" : "false");
+        }
+        
+        // Accept both 80-byte (standard) and 112-byte (padded) headers for verification
+        if (header.size() != FIXED_HEADER_RECORD_SIZE && header.size() != 80) {
+            if (err) *err = QString("Header verification failed for header at height %1: wrong size (expected %2 or 80 bytes, got %3)")
                 .arg(height).arg(FIXED_HEADER_RECORD_SIZE).arg(header.size());
             return false;
         }
@@ -235,12 +249,18 @@ namespace BTC
             // For clarity in code below
             const bool prevIsAlphaRandomX = prevIsRandomX;
             
-            // Since all headers are stored as fixed-size records in the database, we need to accept
-            // this size for all headers, regardless of whether they're RandomX blocks or not
-            if (prev.size() != FIXED_HEADER_RECORD_SIZE) {
-                if (err) *err = QString("Invalid header size for block %1: expected %2 bytes, got %3")
+            // Accept both 80-byte (standard) and 112-byte (padded) headers for previous block
+            if (prev.size() != FIXED_HEADER_RECORD_SIZE && prev.size() != 80) {
+                if (err) *err = QString("Invalid header size for block %1: expected %2 or 80 bytes, got %3")
                     .arg(prevHeight).arg(FIXED_HEADER_RECORD_SIZE).arg(prev.size());
                 return false;
+            }
+            
+            // Add debug info for the first few blocks
+            if (height < 10) {
+                Debug() << "checkInner: previous header at height " << prevHeight 
+                       << ": header size=" << prev.size() 
+                       << ", isRandomX=" << (prevIsRandomX ? "true" : "false");
             }
             
             /* 
