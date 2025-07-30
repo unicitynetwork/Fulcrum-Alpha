@@ -43,9 +43,8 @@ public:
         READWRITE(obj.nNonce);
         
         // Alpha extension - include hashRandomX field for RandomX blocks
-        // RandomX blocks are identified by the version bit 0x20000000
-        // This bit is set on all blocks from height ALPHA_RANDOMX_ACTIVATION_HEIGHT onwards
-        const bool isRandomXBlock = (obj.nVersion & 0x20000000) == 0x20000000;
+        // In mixed chain period: 0x20000000 = SHA256, 0x20000002 = RandomX
+        const bool isRandomXBlock = (obj.nVersion == 0x20000002);
         if (isRandomXBlock) {
             READWRITE(obj.hashRandomX);
         }

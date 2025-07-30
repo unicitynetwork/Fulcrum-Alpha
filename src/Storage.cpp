@@ -1072,7 +1072,8 @@ struct Storage::Pvt
     int blockHeaderSize(int height = -1) const {
         // For Alpha chain, use 112-byte headers after the RandomX activation height
         if (height >= 0) {
-            // If we know the height, we can be precise
+            // If we know the height, use height-based fallback (for storage sizing)
+            // Note: This is less precise than version bit detection but sufficient for storage
             bool isAfterRandomXActivation = BTC::IsRandomXBlock(height);
             int size = BTC::GetBlockHeaderSize(isAfterRandomXActivation);
             
@@ -3451,6 +3452,7 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
             QByteArray rawHeader;
             {
                 QString errMsg;
+                
                 if (!p->headerVerifier(ppb->header, &errMsg) ) {
                     // XXX possible reorg point. Caller will/should roll back the db state via issuing calls to undoLatestBlock()
                     throw HeaderVerificationFailure(errMsg);
@@ -3531,6 +3533,17 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                             if (undo) { // save undo info if we are in saveUndo mode
                                 undo->addUndos.emplace_back(txo, info.hashX, ctxo);
                             }
+                            
+                            // Debug logging for the specific UTXO that's causing issues
+                            if (ppb->height >= 301000 && hash.toHex() == "f808ce16a52ce075755c3e5e20b087d65179109ef94d0df5d80bb17e6adb216b") {
+                                Debug() << "CREATING TARGET UTXO:";
+                                Debug() << "  Block height: " << ppb->height;
+                                Debug() << "  Creating txid: " << hash.toHex();
+                                Debug() << "  Output number: " << out.outN;
+                                Debug() << "  Amount: " << info.amount.ToString();
+                                Debug() << "  TxNum: " << info.txNum;
+                            }
+                            
                             if constexpr (debugPrt)
                                 Debug() << "Added txo: " << txo.toString()
                                         << " (txid: " << hash.toHex() << " height: " << ppb->height << ") "
@@ -3585,6 +3598,16 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                                 const auto dbgTxIdHex = ppb->txHashForInputIdx(inum).toHex();
                                 QTextStream ts(&s);
                                 ts << "Failed to spend: " << in.prevoutHash.toHex() << ":" << in.prevoutN << " (spending txid: " << dbgTxIdHex << ")";
+                                
+                                // Debug logging for blocks after 302000 to understand UTXO issues
+                                if (ppb->height >= 301500) {
+                                    Log() << "UTXO FAILURE DEBUG:";
+                                    Log() << "  Block height: " << ppb->height;
+                                    Log() << "  Spending txid: " << dbgTxIdHex;
+                                    Log() << "  Missing UTXO: " << in.prevoutHash.toHex() << ":" << in.prevoutN;
+                                    Log() << "  Input number: " << ppb->numForInputIdx(inum).value_or(0xffff);
+                                    Log() << "  Block has " << ppb->txInfos.size() << " transactions";
+                                }
                             }
                             throw InternalError(s);
                         }

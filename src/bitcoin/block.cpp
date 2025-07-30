@@ -13,17 +13,8 @@
 namespace bitcoin {
 
 uint256 CBlockHeader::GetHash() const {
-    // For Alpha chain, determine how to get the hash:
-    // 1. For blocks after RandomX activation height, the hashRandomX field should contain the hash
-    // 2. For earlier blocks, we need to calculate the standard double-SHA256 hash
-    
-    // If hashRandomX is set (only for blocks after BTC::ALPHA_RANDOMX_ACTIVATION_HEIGHT),
-    // use that value directly
-    if (!hashRandomX.IsNull()) {
-        return hashRandomX;
-    }
-    
-    // Default behavior - use standard double-SHA256
+    // For Alpha chain, always use standard SerializeHash for block hash calculation
+    // The hashRandomX field is for proof-of-work validation, not for chain linkage
     return SerializeHash(*this);
 }
 
