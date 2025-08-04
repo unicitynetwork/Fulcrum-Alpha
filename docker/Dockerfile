@@ -39,10 +39,11 @@ ENV SSL_CERTFILE=${DATA_DIR}/fulcrum.crt
 ENV SSL_KEYFILE=${DATA_DIR}/fulcrum.key
 
 # Fulcrum ports
-EXPOSE 50001 50002
-
-# Additional port for Alpha-specific connections
-EXPOSE 50003
+EXPOSE 50001 50002 50003 50004
+# 50001 - TCP
+# 50002 - SSL
+# 50003 - WebSocket
+# 50004 - WebSocket Secure
 
 COPY docker/docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

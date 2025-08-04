@@ -33,7 +33,8 @@ services:
     ports:
       - "50001:50001"  # TCP port
       - "50002:50002"  # SSL port
-      - "50003:50003"  # WebSocket port (optional)
+      - "50003:50003"  # WebSocket port
+      - "50004:50004"  # WebSocket Secure port (optional)
     volumes:
       - fulcrum-data:/data
       - ./config/fulcrum.conf:/data/fulcrum.conf:ro
