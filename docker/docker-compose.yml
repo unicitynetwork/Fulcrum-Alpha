@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  alpha-node:
+    image: ghcr.io/unicitynetwork/alpha/alpha:latest
+    container_name: alpha-node
+    restart: unless-stopped
+    ports:
+      - "8589:8589"  # RPC port
+      - "8590:8590"  # P2P port
+    volumes:
+      - alpha-data:/root/.alpha
+      - ./config:/config:ro
+    networks:
+      - alpha-network
+    healthcheck:
+      test: ["CMD", "alpha-cli", "-rpcconnect=127.0.0.1", "-rpcport=8589", "getblockcount"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  fulcrum-alpha:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: fulcrum-alpha:latest
+    container_name: fulcrum-alpha
+    restart: unless-stopped
+    depends_on:
+      alpha-node:
+        condition: service_healthy
+    ports:
+      - "50001:50001"  # TCP port
+      - "50002:50002"  # SSL port
+      - "50003:50003"  # WebSocket port (optional)
+    volumes:
+      - fulcrum-data:/data
+      - ./config/fulcrum.conf:/data/fulcrum.conf:ro
+    environment:
+      - DATA_DIR=/data
+      - ALPHA_HOST=alpha-node
+      - ALPHA_RPC_PORT=8589
+    networks:
+      - alpha-network
+    command: ["Fulcrum"]
+
+volumes:
+  alpha-data:
+    driver: local
+  fulcrum-data:
+    driver: local
+
+networks:
+  alpha-network:
+    driver: bridge
