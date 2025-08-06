@@ -1,0 +1,13 @@
+version: '3.8'
+
+# Docker Compose override file for SSL/TLS support
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.ssl.yml up -d
+
+services:
+  fulcrum-alpha:
+    volumes:
+      # Add SSL certificate mount
+      - ./ssl:/ssl:ro
+    environment:
+      # SSL is auto-detected from /ssl directory
+      - SSL_ENABLED=true

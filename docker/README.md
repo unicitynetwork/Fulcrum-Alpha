@@ -207,20 +207,53 @@ cp config/.env.example .env
 # Edit .env with your settings
 ```
 
-## SSL Certificates
+## SSL/TLS Support
 
-SSL certificates are automatically generated on first run. To use custom certificates:
+### Automatic SSL Detection
 
-1. Place your certificates in the data volume:
+Fulcrum-Alpha automatically configures itself based on SSL certificate availability:
+
+**Without SSL certificates:**
+- TCP on port 50001
+- WebSocket (ws) on port 50003
+- SSL ports are disabled
+
+**With SSL certificates:**
+- SSL/TLS on port 50002 (replaces TCP)
+- WebSocket Secure (wss) on port 50004 (replaces ws)
+- Plain TCP and ws ports are disabled
+
+### Using Custom SSL Certificates
+
+1. Create an SSL directory and add your certificates:
    ```bash
-   docker cp fulcrum.crt fulcrum-alpha:/data/
-   docker cp fulcrum.key fulcrum-alpha:/data/
+   mkdir ssl
+   cp /path/to/your/cert.pem ssl/fulcrum.crt
+   cp /path/to/your/key.pem ssl/fulcrum.key
+   chmod 600 ssl/fulcrum.key
    ```
 
-2. Restart the container:
+2. Run with SSL support:
    ```bash
-   docker-compose restart fulcrum-alpha
+   docker-compose -f docker-compose.yml -f docker-compose.ssl.yml up -d
    ```
+
+3. Or mount certificates directly:
+   ```bash
+   docker run -d --name fulcrum-alpha \
+       --network alpha-net \
+       -p 50002:50002 -p 50004:50004 \
+       -v fulcrum-data:/data \
+       -v ./ssl:/ssl:ro \
+       ghcr.io/unicitynetwork/alpha/fulcrum:latest
+   ```
+
+### Certificate Requirements
+
+- Files must be named `fulcrum.crt` and `fulcrum.key`
+- Key file should have 600 permissions
+- Certificates are mounted read-only from `/ssl` directory
+- PEM format is required
 
 ## Networking
 
