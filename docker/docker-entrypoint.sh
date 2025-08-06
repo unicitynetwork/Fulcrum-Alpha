@@ -30,10 +30,22 @@ configure_ssl_and_websocket() {
   CONFIG_FILE="$CONFIG_DIR/fulcrum.conf"
   
   # Check if SSL certificates are mounted
+  # Support both standard names and Let's Encrypt names
+  local ssl_found=0
+  
   if [ -f "$SSL_CERT_DIR/fulcrum.crt" ] && [ -f "$SSL_CERT_DIR/fulcrum.key" ]; then
-    echo "Found mounted SSL certificates"
+    echo "Found mounted SSL certificates (standard names)"
     cp "$SSL_CERT_DIR/fulcrum.crt" "$DATA_SSL_CERT"
     cp "$SSL_CERT_DIR/fulcrum.key" "$DATA_SSL_KEY"
+    ssl_found=1
+  elif [ -f "$SSL_CERT_DIR/fullchain.pem" ] && [ -f "$SSL_CERT_DIR/privkey.pem" ]; then
+    echo "Found mounted SSL certificates (Let's Encrypt)"
+    cp "$SSL_CERT_DIR/fullchain.pem" "$DATA_SSL_CERT"
+    cp "$SSL_CERT_DIR/privkey.pem" "$DATA_SSL_KEY"
+    ssl_found=1
+  fi
+  
+  if [ $ssl_found -eq 1 ]; then
     chmod 600 "$DATA_SSL_KEY"
     echo "SSL certificates copied to data directory"
     
