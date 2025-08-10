@@ -99,59 +99,32 @@ wait_for_alpha() {
   fi
 }
 
-# Function to clean corrupted database
-clean_corrupted_db() {
-  echo "🔧 Cleaning corrupted database..."
-  # Remove all database files except config and SSL certs
-  find /data -type f -not -name "*.conf" -not -name "*.crt" -not -name "*.key" -delete 2>/dev/null || true
-  find /data -type d -not -path "/data" -exec rm -rf {} + 2>/dev/null || true
+# Function to clean database (removes all database subdirectories while preserving config and SSL files)
+clean_database() {
+  echo "🔧 Cleaning database..."
+  # Remove all RocksDB subdirectories
+  for subdir in meta blkinfo utxoset scripthash_history scripthash_unspent undo txhash2txnum rpa; do
+    if [ -d "/data/$subdir" ]; then
+      echo "  Removing $subdir..."
+      rm -rf "/data/$subdir"
+    fi
+  done
+  # Remove any other files that aren't config or SSL certificates
+  find /data -maxdepth 1 -type f -not -name "*.conf" -not -name "*.crt" -not -name "*.key" -not -name "*.pem" -delete 2>/dev/null || true
   echo "✅ Database cleaned"
 }
 
-# Function to run Fulcrum with auto-recovery
-run_with_recovery() {
-  local max_retries=3
-  local retry_count=0
-  local retry_delay=10
-  
-  while [ $retry_count -lt $max_retries ]; do
-    echo "Starting Fulcrum server (attempt $((retry_count + 1))/$max_retries)..."
-    
-    # Run Fulcrum and capture exit code
-    set +e
-    Fulcrum "$CONFIG_FILE" "${@:2}" 2>&1 | tee /tmp/fulcrum.log
-    exit_code=$?
-    set -e
-    
-    # Check if it was a clean exit
-    if [ $exit_code -eq 0 ]; then
-      echo "Fulcrum exited cleanly"
-      break
-    fi
-    
-    # Check for database corruption
-    if grep -q "database has been corrupted\|inconsistent state\|forcefully killed" /tmp/fulcrum.log; then
-      echo "⚠️  Database corruption detected!"
-      clean_corrupted_db
-      retry_count=0  # Reset counter after cleaning
-      echo "🔄 Restarting with clean database..."
-    else
-      retry_count=$((retry_count + 1))
-      if [ $retry_count -lt $max_retries ]; then
-        echo "⚠️  Fulcrum crashed (exit code: $exit_code)"
-        echo "🔄 Retrying in $retry_delay seconds..."
-        sleep $retry_delay
-      fi
-    fi
-  done
-  
-  if [ $retry_count -ge $max_retries ]; then
-    echo "❌ Fulcrum failed after $max_retries attempts"
-    exit 1
-  fi
+# Function to run Fulcrum
+run_fulcrum() {
+  echo "Starting Fulcrum server..."
+  exec Fulcrum "$CONFIG_FILE" "${@:2}"
 }
 
 # Main execution
+# Clean database on every start to prevent corruption issues
+echo "🧹 Cleaning database on startup to ensure fresh state..."
+clean_database
+
 # Handle configuration
 setup_config
 
@@ -167,8 +140,8 @@ wait_for_alpha
 
 # First argument is Fulcrum or FulcrumAdmin
 if [ "$1" = "Fulcrum" ]; then
-  # Run with auto-recovery
-  run_with_recovery "$@"
+  # Run Fulcrum
+  run_fulcrum "$@"
 elif [ "$1" = "FulcrumAdmin" ]; then
   echo "Running FulcrumAdmin..."
   exec FulcrumAdmin "${@:2}"
