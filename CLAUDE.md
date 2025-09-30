@@ -26,8 +26,15 @@ make -j8
 ./Fulcrum --test
 ./Fulcrum --bench
 
-# Docker build
+# Run specific test
+./Fulcrum --test "TestName"
+
+# Docker build (original)
 cd contrib/docker
+docker build -t fulcrum-alpha .
+
+# Docker build (enhanced with SSL support)
+cd docker
 docker build -t fulcrum-alpha .
 ```
 
@@ -50,16 +57,19 @@ docker build -t fulcrum-alpha .
 ### RandomX/Alpha Specifics
 
 - **Extended Headers**: Alpha uses 112-byte headers (vs 80-byte standard) after block 70,228
-- **Version Detection**: RandomX blocks identified by version bit `0x20000000`
+- **Version Detection**: RandomX blocks identified by version bit `0x20000000`, mixed chain period uses `0x20000002`
 - **Trust Model**: Fulcrum trusts the connected node for hash validation (no local RandomX verification)
 - **Configuration**: Use `coin=alpha` in config file
+- **Mixed Chain Period**: Supports both SHA-256 and RandomX blocks during transition
 
 ### Important Files
 
-- `src/CBlockHeader.h`: Modified block header structure for RandomX support
+- `src/bitcoin/block.h`: Extended CBlockHeader with RandomX support (includes `hashRandomX` field)
 - `src/Controller.cpp`: Contains coin detection and RandomX block handling logic
 - `src/Storage.cpp`: Database schema and block storage implementation
+- `src/BTC.h`: Coin detection and Alpha-specific constants
 - `doc/alpha.conf`: Alpha-specific configuration template
+- `FulcrumAdmin`: Python 3.6+ admin script for server management
 
 ## Development Guidelines
 
@@ -77,8 +87,9 @@ docker build -t fulcrum-alpha .
 
 ### Dependencies
 - Qt 5.15.2+ (Core, Network modules only)
-- RocksDB (static library included in `staticlibs/`)
-- Optional: libzmq, jemalloc, libminiupnpc
+- RocksDB (static library v9.2.1 included in `staticlibs/`)
+- C++20 compiler (GCC 11+, Clang 17+, or MinGW G++ 11+)
+- Optional: libzmq 4.x (for ZMQ notifications), jemalloc, libminiupnpc
 
 ### Common Tasks
 
@@ -89,11 +100,17 @@ docker build -t fulcrum-alpha .
 # Validate configuration
 ./Fulcrum -C /path/to/config.conf --checkconfig
 
-# Run specific test
-./Fulcrum --test "TestName"
-
 # Debug logging
 ./Fulcrum -d -v  # Debug verbosity
+
+# Admin operations
+./FulcrumAdmin -h localhost -p 8000  # Connect to admin port
+
+# Start server with config
+./Fulcrum /path/to/alpha.conf
+
+# Database operations
+./Fulcrum --compact  # Compact the database
 ```
 
 ## Important Notes

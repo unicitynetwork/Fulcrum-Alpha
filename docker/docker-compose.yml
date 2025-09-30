@@ -31,13 +31,16 @@ services:
       alpha-node:
         condition: service_healthy
     ports:
-      - "50001:50001"  # TCP port
-      - "50002:50002"  # SSL port
+      - "50001:50001"  # TCP port (Electrum protocol)
+      - "50002:50002"  # SSL/TLS port (Electrum protocol over SSL)
       - "50003:50003"  # WebSocket port
-      - "50004:50004"  # WebSocket Secure port (optional)
+      - "50004:50004"  # WebSocket Secure port
     volumes:
       - fulcrum-data:/data
-      - ./config/fulcrum.conf:/data/fulcrum.conf:ro
+      # Optional: Mount custom config (comment out if using default)
+      #- ./config/fulcrum.conf:/config/fulcrum.conf:ro
+      # Optional: Mount SSL certificates for TLS support
+      #- ./ssl:/ssl:ro  # Place fulcrum.crt and fulcrum.key here
     environment:
       - DATA_DIR=/data
       - ALPHA_HOST=alpha-node

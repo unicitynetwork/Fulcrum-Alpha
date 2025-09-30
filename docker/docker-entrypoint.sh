@@ -29,6 +29,9 @@ configure_ssl_and_websocket() {
   DATA_SSL_KEY="${DATA_DIR}/fulcrum.key"
   CONFIG_FILE="$CONFIG_DIR/fulcrum.conf"
   
+  echo "Checking for SSL certificates in $SSL_CERT_DIR..."
+  ls -la "$SSL_CERT_DIR" 2>/dev/null || echo "SSL directory not found or empty"
+  
   # Check if SSL certificates are mounted
   # Support both standard names and Let's Encrypt names
   local ssl_found=0
@@ -43,6 +46,9 @@ configure_ssl_and_websocket() {
     cp "$SSL_CERT_DIR/fullchain.pem" "$DATA_SSL_CERT"
     cp "$SSL_CERT_DIR/privkey.pem" "$DATA_SSL_KEY"
     ssl_found=1
+  else
+    echo "No SSL certificates found in $SSL_CERT_DIR"
+    echo "Looked for: fulcrum.crt/fulcrum.key OR fullchain.pem/privkey.pem"
   fi
   
   if [ $ssl_found -eq 1 ]; then
@@ -52,31 +58,63 @@ configure_ssl_and_websocket() {
     # Create temporary config file
     cp "$CONFIG_FILE" "$CONFIG_FILE.tmp"
     
-    # Comment out plain ports (tcp and ws) and enable secure ports (ssl and wss)
-    sed -i 's/^tcp\s*=/#tcp =/' "$CONFIG_FILE.tmp"
-    sed -i 's/^ws\s*=/#ws =/' "$CONFIG_FILE.tmp"
+    # Enable SSL and WSS ports (keep TCP and WS enabled too for compatibility)
+    # This allows both encrypted and unencrypted connections
     
-    # Enable SSL and WSS if not already enabled
+    # Ensure TCP is enabled
+    if ! grep -q "^tcp\s*=" "$CONFIG_FILE.tmp"; then
+      echo "tcp = 0.0.0.0:50001" >> "$CONFIG_FILE.tmp"
+    else
+      sed -i 's/^#tcp\s*=/tcp =/' "$CONFIG_FILE.tmp"
+    fi
+    
+    # Enable SSL
     if ! grep -q "^ssl\s*=" "$CONFIG_FILE.tmp"; then
       echo "ssl = 0.0.0.0:50002" >> "$CONFIG_FILE.tmp"
     else
       sed -i 's/^#ssl\s*=/ssl =/' "$CONFIG_FILE.tmp"
     fi
     
+    # Ensure WS is enabled
+    if ! grep -q "^ws\s*=" "$CONFIG_FILE.tmp"; then
+      echo "ws = 0.0.0.0:50003" >> "$CONFIG_FILE.tmp"
+    else
+      sed -i 's/^#ws\s*=/ws =/' "$CONFIG_FILE.tmp"
+    fi
+    
+    # Enable WSS
     if ! grep -q "^wss\s*=" "$CONFIG_FILE.tmp"; then
       echo "wss = 0.0.0.0:50004" >> "$CONFIG_FILE.tmp"
     else
       sed -i 's/^#wss\s*=/wss =/' "$CONFIG_FILE.tmp"
     fi
     
+    # Ensure cert and key paths are set and uncommented
+    if ! grep -q "^cert\s*=" "$CONFIG_FILE.tmp"; then
+      echo "cert = /data/fulcrum.crt" >> "$CONFIG_FILE.tmp"
+    else
+      sed -i 's/^#cert\s*=/cert =/' "$CONFIG_FILE.tmp"
+    fi
+    
+    if ! grep -q "^key\s*=" "$CONFIG_FILE.tmp"; then
+      echo "key = /data/fulcrum.key" >> "$CONFIG_FILE.tmp"
+    else
+      sed -i 's/^#key\s*=/key =/' "$CONFIG_FILE.tmp"
+    fi
+    
     # Move the modified config back
     mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
     
-    echo "Configuration updated: SSL enabled, using secure ports only"
-    echo "  - TCP disabled, SSL on port 50002"
-    echo "  - WS disabled, WSS on port 50004"
+    echo "Configuration updated: Both SSL and non-SSL ports enabled"
+    echo "  - TCP on port 50001"
+    echo "  - SSL on port 50002"
+    echo "  - WS on port 50003"
+    echo "  - WSS on port 50004"
+    echo ""
+    echo "Final configuration check:"
+    grep -E "^(tcp|ssl|ws|wss|cert|key)\s*=" "$CONFIG_FILE" || echo "No network ports configured!"
   else
-    echo "No SSL certificates found, using plain TCP and WebSocket"
+    echo "No SSL certificates found, using plain TCP and WebSocket only"
     # Ensure ssl and wss are commented out if they exist
     sed -i 's/^ssl\s*=/#ssl =/' "$CONFIG_FILE"
     sed -i 's/^wss\s*=/#wss =/' "$CONFIG_FILE"
