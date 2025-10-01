@@ -63,6 +63,7 @@ configure_ssl_and_websocket() {
     
     # Ensure TCP is enabled
     if ! grep -q "^tcp\s*=" "$CONFIG_FILE.tmp"; then
+      echo "" >> "$CONFIG_FILE.tmp"
       echo "tcp = 0.0.0.0:50001" >> "$CONFIG_FILE.tmp"
     else
       sed -i 's/^#tcp\s*=/tcp =/' "$CONFIG_FILE.tmp"
@@ -70,6 +71,8 @@ configure_ssl_and_websocket() {
     
     # Enable SSL
     if ! grep -q "^ssl\s*=" "$CONFIG_FILE.tmp"; then
+      # Ensure file ends with newline before appending
+      echo "" >> "$CONFIG_FILE.tmp"
       echo "ssl = 0.0.0.0:50002" >> "$CONFIG_FILE.tmp"
     else
       sed -i 's/^#ssl\s*=/ssl =/' "$CONFIG_FILE.tmp"
@@ -77,6 +80,7 @@ configure_ssl_and_websocket() {
     
     # Ensure WS is enabled
     if ! grep -q "^ws\s*=" "$CONFIG_FILE.tmp"; then
+      echo "" >> "$CONFIG_FILE.tmp"
       echo "ws = 0.0.0.0:50003" >> "$CONFIG_FILE.tmp"
     else
       sed -i 's/^#ws\s*=/ws =/' "$CONFIG_FILE.tmp"
@@ -84,6 +88,7 @@ configure_ssl_and_websocket() {
     
     # Enable WSS
     if ! grep -q "^wss\s*=" "$CONFIG_FILE.tmp"; then
+      echo "" >> "$CONFIG_FILE.tmp"
       echo "wss = 0.0.0.0:50004" >> "$CONFIG_FILE.tmp"
     else
       sed -i 's/^#wss\s*=/wss =/' "$CONFIG_FILE.tmp"
@@ -91,12 +96,14 @@ configure_ssl_and_websocket() {
     
     # Ensure cert and key paths are set and uncommented
     if ! grep -q "^cert\s*=" "$CONFIG_FILE.tmp"; then
+      echo "" >> "$CONFIG_FILE.tmp"
       echo "cert = /data/fulcrum.crt" >> "$CONFIG_FILE.tmp"
     else
       sed -i 's/^#cert\s*=/cert =/' "$CONFIG_FILE.tmp"
     fi
     
     if ! grep -q "^key\s*=" "$CONFIG_FILE.tmp"; then
+      echo "" >> "$CONFIG_FILE.tmp"
       echo "key = /data/fulcrum.key" >> "$CONFIG_FILE.tmp"
     else
       sed -i 's/^#key\s*=/key =/' "$CONFIG_FILE.tmp"
