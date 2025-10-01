@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Script to run Fulcrum with SSL certificates mounted directly from their source location
-# No intermediate copying - certificates are mounted directly into the container
+# Main script to run Fulcrum with optional SSL support
+# SSL certificates can be auto-detected from Let's Encrypt or specified manually
 
 set -e
 
@@ -9,8 +9,8 @@ set -e
 CONTAINER_NAME="${CONTAINER_NAME:-fulcrum-alpha}"
 NETWORK_NAME="${NETWORK_NAME:-alpha-net}"
 
-echo "Fulcrum Direct Certificate Mount"
-echo "================================"
+echo "Fulcrum Docker Runner"
+echo "===================="
 echo ""
 
 # Parse command line arguments
