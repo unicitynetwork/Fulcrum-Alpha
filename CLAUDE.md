@@ -29,12 +29,20 @@ make -j8
 # Run specific test
 ./Fulcrum --test "TestName"
 
-# Docker build (original)
-cd contrib/docker
-docker build -t fulcrum-alpha .
-
-# Docker build (enhanced with SSL support)
+# Docker build and run
 cd docker
+./build.sh                    # Build image
+./run-fulcrum.sh              # Run without SSL
+sudo ./run-fulcrum.sh         # Run with SSL (auto-detect Let's Encrypt certs)
+./run-fulcrum.sh --domain example.com  # Run with specific domain
+./test-ssl.sh                 # Test SSL connection
+
+# Docker management
+docker logs -f fulcrum-alpha  # View logs
+docker stop fulcrum-alpha     # Stop container
+
+# Legacy Docker build (original location)
+cd contrib/docker
 docker build -t fulcrum-alpha .
 ```
 
@@ -68,8 +76,11 @@ docker build -t fulcrum-alpha .
 - `src/Controller.cpp`: Contains coin detection and RandomX block handling logic
 - `src/Storage.cpp`: Database schema and block storage implementation
 - `src/BTC.h`: Coin detection and Alpha-specific constants
+- `src/Mgr.h`: Base manager class providing lifecycle management for subsystems
 - `doc/alpha.conf`: Alpha-specific configuration template
 - `FulcrumAdmin`: Python 3.6+ admin script for server management
+- `docker/run-fulcrum.sh`: Docker runner with SSL auto-detection
+- `docker/README.md`: Docker setup documentation with SSL/TLS instructions
 
 ## Development Guidelines
 
@@ -113,6 +124,21 @@ docker build -t fulcrum-alpha .
 ./Fulcrum --compact  # Compact the database
 ```
 
+## Docker Deployment
+
+### Production Setup
+- The `docker/` directory contains production-ready Docker setup with SSL/TLS support
+- `run-fulcrum.sh` provides interactive image selection between local and registry images
+- SSL certificates are auto-detected from Let's Encrypt (`/etc/letsencrypt/live/`)
+- Database is automatically cleaned on container start to prevent corruption
+- Network ports: 50001 (TCP), 50002 (SSL), 50003 (WS), 50004 (WSS)
+
+### Multiple Instances
+```bash
+./run-fulcrum.sh --domain site1.com --container-name fulcrum-1
+./run-fulcrum.sh --domain site2.com --container-name fulcrum-2
+```
+
 ## Important Notes
 
 1. **Header Size Handling**: When working with block headers, always check if it's a RandomX block (112 bytes) or standard (80 bytes)
@@ -120,3 +146,4 @@ docker build -t fulcrum-alpha .
 3. **Memory Management**: Uses Qt's parent-child ownership model extensively
 4. **Error Handling**: Exceptions are used sparingly; prefer Qt's error signaling patterns
 5. **Performance**: Code is optimized for high throughput; avoid unnecessary allocations in hot paths
+6. **Trust Boundary**: Fulcrum trusts the connected Alpha node for RandomX hash validation - do not connect to untrusted nodes
