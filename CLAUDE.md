@@ -97,10 +97,17 @@ docker build -t fulcrum-alpha .
 - JSON test data in `test/` directory
 
 ### Dependencies
-- Qt 5.15.2+ (Core, Network modules only)
+- Qt 5.15.2+ (Core, Network modules only) - Qt 5.15.1 or earlier NOT supported
 - RocksDB (static library v9.2.1 included in `staticlibs/`)
 - C++20 compiler (GCC 11+, Clang 17+, or MinGW G++ 11+)
-- Optional: libzmq 4.x (for ZMQ notifications), jemalloc, libminiupnpc
+- libbz2-dev (required for compilation on Linux)
+- Optional: libzmq 4.x (for ZMQ notifications via `zmqpubhashblock` in bitcoind), jemalloc, libminiupnpc (for UPnP support)
+
+### Build Notes
+- **MSVC not supported** - Use MinGW G++ on Windows
+- **System librocksdb** (experimental): Can link against system rocksdb 6.6.4+ with `qmake LIBS=-lrocksdb`
+- **libzmq**: Highly recommended for better performance with bitcoind ZMQ notifications
+- **Static builds**: Docker-based build scripts available in `contrib/build/` for Linux and Windows
 
 ### Common Tasks
 
@@ -122,22 +129,61 @@ docker build -t fulcrum-alpha .
 
 # Database operations
 ./Fulcrum --compact  # Compact the database
+
+# Admin operations (requires admin port configured via -a or admin= in config)
+./FulcrumAdmin -p 8000 getinfo        # Get server information
+./FulcrumAdmin -p 8000 clients        # List connected clients
+./FulcrumAdmin -p 8000 stop           # Gracefully shutdown
+./FulcrumAdmin -p 8000 loglevel       # Adjust logging verbosity
+./FulcrumAdmin -p 8000 -h             # See all available commands
 ```
+
+## Admin Script
+The `FulcrumAdmin` script (requires Python 3.6+) provides server management capabilities:
+- Requires `admin` port configured in server (config: `admin=`, CLI: `-a`)
+- Available commands: `addpeer`, `ban`, `banpeer`, `clients`, `getinfo`, `kick`, `listbanned`, `loglevel`, `maxbuffer`, `peers`, `query`, `rmpeer`, `stop`, `unban`, `unbanpeer`, `bitcoind_throttle`, `simdjson`
+- Example: `./FulcrumAdmin -h localhost -p 8000 getinfo`
 
 ## Docker Deployment
 
 ### Production Setup
 - The `docker/` directory contains production-ready Docker setup with SSL/TLS support
-- `run-fulcrum.sh` provides interactive image selection between local and registry images
+- `run-fulcrum.sh` provides interactive and non-interactive modes
+- Three RPC endpoint options: Docker container (default), localhost, or custom
 - SSL certificates are auto-detected from Let's Encrypt (`/etc/letsencrypt/live/`)
 - Database is automatically cleaned on container start to prevent corruption
-- Network ports: 50001 (TCP), 50002 (SSL), 50003 (WS), 50004 (WSS)
+- Container always runs on `alpha-net` Docker network
+- Network ports: 50001 (TCP), 50002 (SSL), 50003 (WS), 50004 (WSS) - all customizable
+- Default RPC: `alpha-node:8589` with credentials `user`/`password`
+
+### RPC Endpoint Options
+```bash
+# Docker container (default)
+./run-fulcrum.sh --rpc-container alpha-node
+
+# Localhost (scans for Alpha on host)
+./run-fulcrum.sh --rpc-localhost
+
+# Custom endpoint
+./run-fulcrum.sh --rpc-host 192.168.1.10 --rpc-port 8589 --rpc-user myuser --rpc-pass mypass
+```
 
 ### Multiple Instances
 ```bash
-./run-fulcrum.sh --domain site1.com --container-name fulcrum-1
-./run-fulcrum.sh --domain site2.com --container-name fulcrum-2
+./run-fulcrum.sh --rpc-container alpha-node --container-name fulcrum-1 --no-ssl
+./run-fulcrum.sh --rpc-localhost --domain example.com --container-name fulcrum-2 \
+  --port-tcp 60001 --port-ssl 60002 --port-ws 60003 --port-wss 60004
 ```
+
+## Protocol
+Fulcrum implements the [Electrum Cash 1.5.3 protocol](https://electrum-cash-protocol.readthedocs.io/en/latest/), making it compatible with Electron Cash, Electrum, and other SPV clients. It's a drop-in replacement for ElectronX/ElectrumX servers.
+
+## Node Requirements
+- Full node with JSON-RPC enabled (preferably on same machine)
+- **Must have** `txindex=1` enabled
+- **Must not** be a pruning node
+- **Recommended**: Enable ZMQ with `zmqpubhashblock=tcp://0.0.0.0:8433` for better performance
+- For Alpha: Any compatible node implementation with RandomX support
 
 ## Important Notes
 
@@ -147,3 +193,5 @@ docker build -t fulcrum-alpha .
 4. **Error Handling**: Exceptions are used sparingly; prefer Qt's error signaling patterns
 5. **Performance**: Code is optimized for high throughput; avoid unnecessary allocations in hot paths
 6. **Trust Boundary**: Fulcrum trusts the connected Alpha node for RandomX hash validation - do not connect to untrusted nodes
+7. **Disk Space**: ~40GB for mainnet BCH, 133GB for BTC, varies for Alpha depending on chain height
+8. **Hardware**: Minimum 1GB RAM, 64-bit CPU; SSD strongly recommended over HDD

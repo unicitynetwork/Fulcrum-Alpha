@@ -499,8 +499,10 @@ if [ "$USE_SSL" = "yes" ] || [ "$USE_SSL" = "auto" ]; then
     fi
 fi
 
-# Create temporary config for Docker
-TMP_CONFIG=$(mktemp)
+# Create config directory for Docker (directory mounts are stable across restarts)
+CONFIG_DIR="/tmp/fulcrum-${CONTAINER_NAME}-config"
+mkdir -p "$CONFIG_DIR"
+TMP_CONFIG="$CONFIG_DIR/fulcrum.conf"
 cat > "$TMP_CONFIG" << EOF
 datadir = /data
 coin = alpha
@@ -559,32 +561,41 @@ if [ "$USE_SSL" = "yes" ] && [ -n "$CERT_SOURCE" ] && [ -n "$KEY_SOURCE" ]; then
     echo "🔒 Using image: $IMAGE_NAME"
     echo "🌐 Network: $NETWORK_NAME"
 
-    $DOCKER_CMD run -d --rm --name "$CONTAINER_NAME" \
+    $DOCKER_CMD run -d --restart always --name "$CONTAINER_NAME" \
         --network "$NETWORK_NAME" \
         $ADD_HOST_OPTS \
         -p ${PORT_TCP}:50001 -p ${PORT_SSL}:50002 -p ${PORT_WS}:50003 -p ${PORT_WSS}:50004 \
         -v fulcrum-data:/data \
-        -v "$TMP_CONFIG:/config/fulcrum.conf:ro" \
-        -v "$CERT_SOURCE:/ssl/fullchain.pem:ro" \
-        -v "$KEY_SOURCE:/ssl/privkey.pem:ro" \
         "$IMAGE_NAME"
+
+    # Copy config and SSL certificates into the running container
+    echo "📋 Copying configuration and SSL certificates into container..."
+    $DOCKER_CMD exec "$CONTAINER_NAME" mkdir -p /config /ssl
+    $DOCKER_CMD cp "$CONFIG_DIR/fulcrum.conf" "$CONTAINER_NAME:/config/fulcrum.conf"
+    $DOCKER_CMD cp "$CERT_SOURCE" "$CONTAINER_NAME:/ssl/fullchain.pem"
+    $DOCKER_CMD cp "$KEY_SOURCE" "$CONTAINER_NAME:/ssl/privkey.pem"
 else
     echo "🚀 Starting Fulcrum without SSL..."
     echo "📦 Container: $CONTAINER_NAME"
     echo "🔒 Using image: $IMAGE_NAME"
     echo "🌐 Network: $NETWORK_NAME"
 
-    docker run -d --rm --name "$CONTAINER_NAME" \
+    docker run -d --restart always --name "$CONTAINER_NAME" \
         --network "$NETWORK_NAME" \
         $ADD_HOST_OPTS \
         -p ${PORT_TCP}:50001 -p ${PORT_SSL}:50002 -p ${PORT_WS}:50003 -p ${PORT_WSS}:50004 \
         -v fulcrum-data:/data \
-        -v "$TMP_CONFIG:/config/fulcrum.conf:ro" \
         "$IMAGE_NAME"
+
+    # Copy config into the running container
+    echo "📋 Copying configuration into container..."
+    docker exec "$CONTAINER_NAME" mkdir -p /config
+    docker cp "$CONFIG_DIR/fulcrum.conf" "$CONTAINER_NAME:/config/fulcrum.conf"
 fi
 
-# Cleanup temp config after a delay
-(sleep 5 && rm -f "$TMP_CONFIG") &
+# Clean up temporary config directory from host
+rm -rf "$CONFIG_DIR"
+echo "🧹 Cleaned up temporary config directory"
 
 echo ""
 echo "✅ Fulcrum started successfully in Docker"

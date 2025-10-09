@@ -6,19 +6,34 @@ setup_config() {
   # Default location for config
   CONFIG_DIR="/data"
   mkdir -p $CONFIG_DIR
-  
+
+  # Wait for config to be copied via docker cp (max 30 seconds)
+  if [ ! -f "$CONFIG_DIR/fulcrum.conf" ]; then
+    echo "Waiting for configuration to be copied via docker cp..."
+    for i in {1..30}; do
+      if [ -f "/config/fulcrum.conf" ]; then
+        echo "Configuration file appeared, copying..."
+        cp /config/fulcrum.conf $CONFIG_DIR/fulcrum.conf
+        break
+      fi
+      sleep 1
+    done
+  fi
+
   # Check for mounted config file at /config/fulcrum.conf (consistent with alpha pattern)
-  if [ -f "/config/fulcrum.conf" ]; then
+  if [ -f "/config/fulcrum.conf" ] && [ ! -f "$CONFIG_DIR/fulcrum.conf" ]; then
     echo "Using mounted configuration from /config/fulcrum.conf"
     cp /config/fulcrum.conf $CONFIG_DIR/fulcrum.conf
   # Check for local config file
-  elif [ -f "/etc/fulcrum/fulcrum.conf" ]; then
+  elif [ ! -f "$CONFIG_DIR/fulcrum.conf" ] && [ -f "/etc/fulcrum/fulcrum.conf" ]; then
     echo "Using local configuration from /etc/fulcrum/fulcrum.conf"
     cp /etc/fulcrum/fulcrum.conf $CONFIG_DIR/fulcrum.conf
   # Use default config file
-  else
+  elif [ ! -f "$CONFIG_DIR/fulcrum.conf" ]; then
     echo "Using default configuration file"
     cp /etc/fulcrum/fulcrum.conf.default $CONFIG_DIR/fulcrum.conf
+  else
+    echo "Using existing configuration from $CONFIG_DIR/fulcrum.conf"
   fi
 }
 
@@ -29,20 +44,27 @@ configure_ssl_and_websocket() {
   DATA_SSL_KEY="${DATA_DIR}/fulcrum.key"
   CONFIG_FILE="$CONFIG_DIR/fulcrum.conf"
   
+  # Wait for SSL certificates to be copied via docker cp (max 10 seconds)
   echo "Checking for SSL certificates in $SSL_CERT_DIR..."
-  ls -la "$SSL_CERT_DIR" 2>/dev/null || echo "SSL directory not found or empty"
-  
-  # Check if SSL certificates are mounted
+  for i in {1..10}; do
+    if [ -d "$SSL_CERT_DIR" ]; then
+      ls -la "$SSL_CERT_DIR" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+  done
+
+  # Check if SSL certificates are available
   # Support both standard names and Let's Encrypt names
   local ssl_found=0
-  
+
   if [ -f "$SSL_CERT_DIR/fulcrum.crt" ] && [ -f "$SSL_CERT_DIR/fulcrum.key" ]; then
-    echo "Found mounted SSL certificates (standard names)"
+    echo "Found SSL certificates (standard names)"
     cp "$SSL_CERT_DIR/fulcrum.crt" "$DATA_SSL_CERT"
     cp "$SSL_CERT_DIR/fulcrum.key" "$DATA_SSL_KEY"
     ssl_found=1
   elif [ -f "$SSL_CERT_DIR/fullchain.pem" ] && [ -f "$SSL_CERT_DIR/privkey.pem" ]; then
-    echo "Found mounted SSL certificates (Let's Encrypt)"
+    echo "Found SSL certificates (Let's Encrypt)"
     cp "$SSL_CERT_DIR/fullchain.pem" "$DATA_SSL_CERT"
     cp "$SSL_CERT_DIR/privkey.pem" "$DATA_SSL_KEY"
     ssl_found=1
