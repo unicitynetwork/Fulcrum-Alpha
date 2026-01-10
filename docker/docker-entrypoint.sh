@@ -1,6 +1,70 @@
 #!/bin/bash
 set -e
 
+# Global variables for process management
+FULCRUM_PID=""
+SHUTDOWN_REQUESTED=0
+RESTART_COUNT=0
+MAX_RESTARTS=10
+BACKOFF_BASE=5
+BACKOFF_MAX=300
+RESTART_WINDOW=3600  # Reset restart count if stable for 1 hour
+LAST_RESTART_TIME=0
+
+# Signal handler for graceful shutdown
+handle_signal() {
+    local signal=$1
+    echo "🛑 Received $signal signal, initiating graceful shutdown..."
+    SHUTDOWN_REQUESTED=1
+
+    if [ -n "$FULCRUM_PID" ] && kill -0 "$FULCRUM_PID" 2>/dev/null; then
+        echo "   Forwarding $signal to Fulcrum (PID $FULCRUM_PID)..."
+        kill -"$signal" "$FULCRUM_PID" 2>/dev/null || true
+
+        # Wait for Fulcrum to exit gracefully (up to 30 seconds)
+        local wait_count=0
+        while kill -0 "$FULCRUM_PID" 2>/dev/null && [ $wait_count -lt 30 ]; do
+            sleep 1
+            ((wait_count++))
+        done
+
+        if kill -0 "$FULCRUM_PID" 2>/dev/null; then
+            echo "   Fulcrum did not exit gracefully, sending SIGKILL..."
+            kill -9 "$FULCRUM_PID" 2>/dev/null || true
+        fi
+    fi
+
+    echo "✅ Graceful shutdown complete"
+    exit 0
+}
+
+# Set up signal handlers
+trap 'handle_signal TERM' SIGTERM
+trap 'handle_signal INT' SIGINT
+
+# Calculate exponential backoff delay
+calculate_backoff() {
+    local count=$1
+    local delay=$((BACKOFF_BASE * (2 ** (count - 1))))
+    if [ $delay -gt $BACKOFF_MAX ]; then
+        delay=$BACKOFF_MAX
+    fi
+    echo $delay
+}
+
+# Check if we should reset restart count (been stable for RESTART_WINDOW)
+check_restart_window() {
+    local now
+    now=$(date +%s)
+    if [ $LAST_RESTART_TIME -gt 0 ]; then
+        local elapsed=$((now - LAST_RESTART_TIME))
+        if [ $elapsed -gt $RESTART_WINDOW ]; then
+            echo "   Fulcrum has been stable for $elapsed seconds, resetting restart count"
+            RESTART_COUNT=0
+        fi
+    fi
+}
+
 # Wait for the "ready" signal from the run script
 # This ensures all config and SSL files are copied before we proceed
 # On restart, if files already exist, skip waiting
@@ -204,10 +268,84 @@ clean_database() {
   echo "✅ Database cleaned"
 }
 
-# Function to run Fulcrum
-run_fulcrum() {
-  echo "Starting Fulcrum server..."
-  exec Fulcrum "$CONFIG_FILE" "${@:2}"
+# Supervisor loop for Fulcrum - restarts on crash with database cleanup
+run_fulcrum_supervised() {
+    local config_file="$1"
+    shift
+    local extra_args=("$@")
+
+    echo "🚀 Starting Fulcrum supervisor loop..."
+    echo "   Config: $config_file"
+    echo "   Max restarts: $MAX_RESTARTS within $RESTART_WINDOW seconds"
+    echo "   Backoff: ${BACKOFF_BASE}s base, ${BACKOFF_MAX}s max"
+
+    while [ $SHUTDOWN_REQUESTED -eq 0 ]; do
+        # Check if we should reset restart count
+        check_restart_window
+
+        # Check if we've exceeded max restarts
+        if [ $RESTART_COUNT -ge $MAX_RESTARTS ]; then
+            echo "❌ Maximum restart count ($MAX_RESTARTS) exceeded within restart window"
+            echo "   This indicates a persistent crash loop. Container will exit."
+            echo "   Please investigate logs and fix the underlying issue."
+            exit 1
+        fi
+
+        echo "▶️  Starting Fulcrum (attempt $((RESTART_COUNT + 1))/$MAX_RESTARTS)..."
+
+        # Start Fulcrum in background so we can track its PID
+        Fulcrum "$config_file" "${extra_args[@]}" &
+        FULCRUM_PID=$!
+        echo "   Fulcrum started with PID $FULCRUM_PID"
+
+        # Wait for Fulcrum to exit
+        wait $FULCRUM_PID
+        EXIT_CODE=$?
+        FULCRUM_PID=""
+
+        # Check if shutdown was requested
+        if [ $SHUTDOWN_REQUESTED -eq 1 ]; then
+            echo "   Shutdown was requested, not restarting"
+            break
+        fi
+
+        # Fulcrum exited unexpectedly
+        LAST_RESTART_TIME=$(date +%s)
+        ((RESTART_COUNT++))
+
+        if [ $EXIT_CODE -eq 0 ]; then
+            echo "⚠️  Fulcrum exited with code 0 (clean exit) - not restarting"
+            echo "   If this was unexpected, check the logs for shutdown reason"
+            break
+        fi
+
+        echo "💥 Fulcrum crashed with exit code $EXIT_CODE"
+        echo "   Restart count: $RESTART_COUNT/$MAX_RESTARTS"
+
+        # Calculate backoff delay
+        local delay
+        delay=$(calculate_backoff $RESTART_COUNT)
+        echo "   Cleaning database before restart..."
+        clean_database
+
+        echo "   Waiting ${delay}s before restart (exponential backoff)..."
+
+        # Sleep with interrupt check for graceful shutdown during backoff
+        local slept=0
+        while [ $slept -lt $delay ] && [ $SHUTDOWN_REQUESTED -eq 0 ]; do
+            sleep 1
+            ((slept++))
+        done
+
+        if [ $SHUTDOWN_REQUESTED -eq 1 ]; then
+            echo "   Shutdown requested during backoff, exiting..."
+            break
+        fi
+
+        echo "   Restarting Fulcrum..."
+    done
+
+    echo "✅ Fulcrum supervisor loop exited"
 }
 
 # Main execution
@@ -233,8 +371,8 @@ wait_for_alpha
 
 # First argument is Fulcrum or FulcrumAdmin
 if [ "$1" = "Fulcrum" ]; then
-  # Run Fulcrum
-  run_fulcrum "$@"
+  # Run Fulcrum with supervisor loop (restarts on crash)
+  run_fulcrum_supervised "$CONFIG_FILE" "${@:2}"
 elif [ "$1" = "FulcrumAdmin" ]; then
   echo "Running FulcrumAdmin..."
   exec FulcrumAdmin "${@:2}"

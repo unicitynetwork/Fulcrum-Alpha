@@ -19,7 +19,8 @@ RUN qmake -makefile PREFIX=/usr Fulcrum.pro && \
 FROM debian:trixie-slim
 
 RUN apt update && \
-    apt install -y openssl libqt5network5 zlib1g libbz2-1.0 libjemalloc2 libzmq5 python3 libminiupnpc18 && \
+    apt install -y openssl libqt5network5 zlib1g libbz2-1.0 libjemalloc2 libzmq5 python3 libminiupnpc18 \
+    procps netcat-openbsd && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
@@ -44,6 +45,10 @@ EXPOSE 50001 50002 50003 50004
 # 50002 - SSL
 # 50003 - WebSocket
 # 50004 - WebSocket Secure
+
+# Health check - verify Fulcrum is responding on TCP port
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD nc -z localhost 50001 || exit 1
 
 COPY docker/docker-entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
