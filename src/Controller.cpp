@@ -581,10 +581,19 @@ void DownloadBlocksTask::do_get(unsigned int bnum)
             submitRequest("getblock", {var, false}, [this, bnum, hash](const RPC::Message & resp){
                 try {
                     auto rawblock = Util::ParseHexFast(resp.result().toByteArray());
-                    // Check if this might be a RandomX block based on block height
-                    // RandomX blocks are all blocks at or after the activation height
-                    const bool isRandomXBlock = BTC::IsRandomXBlock(bnum);
-                    const int headerSize = isRandomXBlock ? BTC::GetBlockHeaderSize(true) : BTC::GetBlockHeaderSize(false);
+                    // Try to determine if this is a RandomX block by checking the raw header data
+                    // First assume standard size and check if we have enough data
+                    bool isRandomXBlock = false;
+                    int headerSize = 80; // Start with standard size
+                    
+                    if (rawblock.size() >= 80) {
+                        // Try to peek at the version field (first 4 bytes, little endian)
+                        const uint32_t version = *reinterpret_cast<const uint32_t*>(rawblock.constData());
+                        // In mixed chain: 0x20000000 = SHA256, 0x20000002 = RandomX
+                        isRandomXBlock = (version == 0x20000002);
+                        headerSize = isRandomXBlock ? BTC::GetBlockHeaderSize(true) : BTC::GetBlockHeaderSize(false);
+                        
+                    }
                     
                     // Get the appropriate header based on whether this is a RandomX block
                     const auto header = rawblock.left(headerSize); // we need a deep copy of this anyway so might as well take it now.

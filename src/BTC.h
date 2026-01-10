@@ -50,9 +50,23 @@ namespace BTC
     /// The block height at which Alpha chain switched to RandomX. Used for header verification.
     static constexpr int ALPHA_RANDOMX_ACTIVATION_HEIGHT = 70228;
     
+    /// The block height at which Alpha chain became mixed (SHA256 + RandomX)
+    static constexpr int ALPHA_MIXED_CHAIN_HEIGHT = 301101;
+    
     /// Helper function to determine if a block is a RandomX block based on height
+    /// Note: This is a fallback for height-based detection. The proper way is to check the version bit.
+    /// After ALPHA_MIXED_CHAIN_HEIGHT, this function is unreliable and version bit detection should be used.
     static inline bool IsRandomXBlock(int height) { 
-        return height >= ALPHA_RANDOMX_ACTIVATION_HEIGHT; 
+        if (height < ALPHA_RANDOMX_ACTIVATION_HEIGHT) return false;  // Pre-RandomX: SHA256
+        if (height < ALPHA_MIXED_CHAIN_HEIGHT) return true;         // RandomX-only period
+        // Mixed period: height-based detection is unreliable, must use version bit
+        return false; // Conservative fallback: assume SHA256 for mixed period
+    }
+    
+    /// Helper function to determine if a block header is a RandomX block based on version bit
+    /// In mixed chain period: 0x20000000 = SHA256, 0x20000002 = RandomX
+    static inline bool IsRandomXBlock(const bitcoin::CBlockHeader& header) {
+        return header.nVersion == 0x20000002;
     }
     
     /// The fixed size for header records in the database
