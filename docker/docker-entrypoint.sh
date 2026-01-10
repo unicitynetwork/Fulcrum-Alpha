@@ -3,10 +3,30 @@ set -e
 
 # Wait for the "ready" signal from the run script
 # This ensures all config and SSL files are copied before we proceed
+# On restart, if files already exist, skip waiting
 wait_for_ready_signal() {
   local SIGNAL_FILE="/tmp/.fulcrum-ready"
   local MAX_WAIT=60  # Maximum wait time in seconds
 
+  # Check if this is a restart with existing config/SSL files
+  # If config exists in /config/ and SSL certs exist in /ssl/, we're ready
+  if [ -f "/config/fulcrum.conf" ]; then
+    if [ -f "/ssl/fullchain.pem" ] && [ -f "/ssl/privkey.pem" ]; then
+      echo "✅ Restart detected: config and SSL certificates already present"
+      rm -f "$SIGNAL_FILE"  # Clean up any stale signal file
+      return 0
+    elif [ -f "/ssl/fulcrum.crt" ] && [ -f "/ssl/fulcrum.key" ]; then
+      echo "✅ Restart detected: config and SSL certificates already present"
+      rm -f "$SIGNAL_FILE"
+      return 0
+    else
+      echo "✅ Restart detected: config present (no SSL)"
+      rm -f "$SIGNAL_FILE"
+      return 0
+    fi
+  fi
+
+  # Fresh start - wait for run script to copy files
   echo "⏳ Waiting for configuration to be ready (signal file: $SIGNAL_FILE)..."
   for i in $(seq 1 $MAX_WAIT); do
     if [ -f "$SIGNAL_FILE" ]; then
