@@ -1,34 +1,43 @@
 #!/bin/bash
 set -e
 
+# Wait for the "ready" signal from the run script
+# This ensures all config and SSL files are copied before we proceed
+wait_for_ready_signal() {
+  local SIGNAL_FILE="/tmp/.fulcrum-ready"
+  local MAX_WAIT=60  # Maximum wait time in seconds
+
+  echo "⏳ Waiting for configuration to be ready (signal file: $SIGNAL_FILE)..."
+  for i in $(seq 1 $MAX_WAIT); do
+    if [ -f "$SIGNAL_FILE" ]; then
+      echo "✅ Ready signal received after ${i}s"
+      rm -f "$SIGNAL_FILE"  # Clean up signal file
+      return 0
+    fi
+    sleep 1
+  done
+
+  echo "⚠️  No ready signal received after ${MAX_WAIT}s, proceeding with available config..."
+  return 0  # Continue anyway to support legacy usage
+}
+
 # Function to handle configuration
 setup_config() {
   # Default location for config
   CONFIG_DIR="/data"
   mkdir -p $CONFIG_DIR
 
-  # Wait for config to be copied via docker cp (max 30 seconds)
-  if [ ! -f "$CONFIG_DIR/fulcrum.conf" ]; then
-    echo "Waiting for configuration to be copied via docker cp..."
-    for i in {1..30}; do
-      if [ -f "/config/fulcrum.conf" ]; then
-        echo "Configuration file appeared, copying..."
-        cp /config/fulcrum.conf $CONFIG_DIR/fulcrum.conf
-        break
-      fi
-      sleep 1
-    done
+  # Check for config file at /config/fulcrum.conf (copied by run script)
+  if [ -f "/config/fulcrum.conf" ]; then
+    echo "Using configuration from /config/fulcrum.conf"
+    cp /config/fulcrum.conf $CONFIG_DIR/fulcrum.conf
   fi
 
-  # Check for mounted config file at /config/fulcrum.conf (consistent with alpha pattern)
-  if [ -f "/config/fulcrum.conf" ] && [ ! -f "$CONFIG_DIR/fulcrum.conf" ]; then
-    echo "Using mounted configuration from /config/fulcrum.conf"
-    cp /config/fulcrum.conf $CONFIG_DIR/fulcrum.conf
-  # Check for local config file
-  elif [ ! -f "$CONFIG_DIR/fulcrum.conf" ] && [ -f "/etc/fulcrum/fulcrum.conf" ]; then
+  # Fallback: Check for local config file
+  if [ ! -f "$CONFIG_DIR/fulcrum.conf" ] && [ -f "/etc/fulcrum/fulcrum.conf" ]; then
     echo "Using local configuration from /etc/fulcrum/fulcrum.conf"
     cp /etc/fulcrum/fulcrum.conf $CONFIG_DIR/fulcrum.conf
-  # Use default config file
+  # Fallback: Use default config file
   elif [ ! -f "$CONFIG_DIR/fulcrum.conf" ]; then
     echo "Using default configuration file"
     cp /etc/fulcrum/fulcrum.conf.default $CONFIG_DIR/fulcrum.conf
@@ -40,19 +49,13 @@ setup_config() {
 # Configure SSL and WebSocket based on certificate availability
 configure_ssl_and_websocket() {
   SSL_CERT_DIR="/ssl"
-  DATA_SSL_CERT="${DATA_DIR}/fulcrum.crt"
-  DATA_SSL_KEY="${DATA_DIR}/fulcrum.key"
+  DATA_SSL_CERT="${CONFIG_DIR}/fulcrum.crt"
+  DATA_SSL_KEY="${CONFIG_DIR}/fulcrum.key"
   CONFIG_FILE="$CONFIG_DIR/fulcrum.conf"
-  
-  # Wait for SSL certificates to be copied via docker cp (max 10 seconds)
+
+  # No need to wait here - ready signal ensures files are already copied
   echo "Checking for SSL certificates in $SSL_CERT_DIR..."
-  for i in {1..10}; do
-    if [ -d "$SSL_CERT_DIR" ]; then
-      ls -la "$SSL_CERT_DIR" 2>/dev/null || true
-      break
-    fi
-    sleep 1
-  done
+  ls -la "$SSL_CERT_DIR" 2>/dev/null || echo "  (directory not found or empty)"
 
   # Check if SSL certificates are available
   # Support both standard names and Let's Encrypt names
@@ -191,6 +194,9 @@ run_fulcrum() {
 # Clean database on every start to prevent corruption issues
 echo "🧹 Cleaning database on startup to ensure fresh state..."
 clean_database
+
+# Wait for run script to finish copying config and SSL certs
+wait_for_ready_signal
 
 # Handle configuration
 setup_config

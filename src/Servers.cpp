@@ -458,7 +458,10 @@ detail::PerIPDataHolder_Temp::PerIPDataHolder_Temp(std::shared_ptr<Client::PerIP
     : QObject(socket), perIPData(std::move(ref))
 {
     setObjectName(kName);
-    if (perIPData) ++perIPData->nClients;
+    if (perIPData) {
+        ++perIPData->nClients;
+        perIPData->lastActivity.store(Util::getTime()); // update last activity timestamp for cleanup tracking
+    }
 }
 detail::PerIPDataHolder_Temp::~PerIPDataHolder_Temp() { if (perIPData) --perIPData->nClients; }
 /*static*/
@@ -483,21 +486,36 @@ bool ServerBase::attachPerIPDataAndCheckLimits(QTcpSocket *socket)
     if (const auto addr = socket->peerAddress(); LIKELY(!addr.isNull())) {
         auto holder = new detail::PerIPDataHolder_Temp(srvmgr->getOrCreatePerIPData(addr), socket); // `new` ok; owned by `socket` (parent QObject)
         const auto maxPerIP = options->maxClientsPerIP;
-        // check connection limit immediately
-        if (const auto & perIPData = holder->perIPData;
-                maxPerIP > 0 && !perIPData->isWhitelisted() && perIPData->nClients > maxPerIP) {
-            // limit reached -- reject connection here
-            if (const qint64 now = Util::getTime(), last = perIPData->lastConnectionLimitReachedWarning.load();
-                    !last || (now - last)/1e3 >= ServerMisc::kMaxClientsPerIPWarningRateLimitSecs) {
-                // Rate-limit the spam of this log message to once every 5 seconds, per IP.  We must do this rate-
-                // limiting of the log message because some port scanners (or abusers) ended up filling our logs with
-                // this message. (Note there is a potential race here in that 2 threads may enter here at once and
-                // update this timestamp simultaneously. This is acceptable for this code here which doesn't need to be
-                // 100% precise, just "good enough" to rate limit log messages most of the time).
-                perIPData->lastConnectionLimitReachedWarning.store(now);
-                Log() << "Connection limit (" << maxPerIP << ") exceeded for " << addr.toString() << ", connection refused";
+        const auto & perIPData = holder->perIPData;
+
+        if (maxPerIP > 0 && perIPData && !perIPData->isWhitelisted()) {
+            const int currentClients = perIPData->nClients.load();
+
+            // Calculate 90% threshold for eviction trigger
+            const int evictionThreshold = static_cast<int>(maxPerIP * 0.9);
+
+            // If at or above 90% of limit, trigger eviction of oldest client to make room
+            if (currentClients >= evictionThreshold && currentClients <= maxPerIP) {
+                DebugM("IP ", addr.toString(), " at ", currentClients, "/", maxPerIP,
+                       " connections (", (currentClients * 100 / maxPerIP), "%), triggering oldest connection eviction");
+                srvmgr->evictOldestClientForIP(addr);
             }
-            ok = false;
+
+            // check connection limit immediately - reject if exceeded
+            if (currentClients > maxPerIP) {
+                // limit reached -- reject connection here
+                if (const qint64 now = Util::getTime(), last = perIPData->lastConnectionLimitReachedWarning.load();
+                        !last || (now - last)/1e3 >= ServerMisc::kMaxClientsPerIPWarningRateLimitSecs) {
+                    // Rate-limit the spam of this log message to once every 5 seconds, per IP.  We must do this rate-
+                    // limiting of the log message because some port scanners (or abusers) ended up filling our logs with
+                    // this message. (Note there is a potential race here in that 2 threads may enter here at once and
+                    // update this timestamp simultaneously. This is acceptable for this code here which doesn't need to be
+                    // 100% precise, just "good enough" to rate limit log messages most of the time).
+                    perIPData->lastConnectionLimitReachedWarning.store(now);
+                    Log() << "Connection limit (" << maxPerIP << ") exceeded for " << addr.toString() << ", connection refused";
+                }
+                ok = false;
+            }
         }
     } else {
         // May happen rarely -- the low-level socket descriptor was "disconnected" already before we could even
@@ -3130,6 +3148,7 @@ Client::Client(const RPC::MethodMap * mm, IdMixin::Id id_in, QTcpSocket *sock, c
         { /* nothing */ }
     }
     socket = sock;
+    createdTime = Util::getTime(); // track when this connection was established for oldest-connection eviction
     stale_threshold = 10 * 60 * 1000; // 10 mins stale threshold; after which clients get disconnected for being idle (for now... TODO: make this configurable)
     pingtime_ms = int(stale_threshold); // this determines how often the pingtimer fires
     status = Connected ; // we are always connected at construction time.

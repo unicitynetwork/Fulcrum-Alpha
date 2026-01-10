@@ -572,8 +572,24 @@ if [ "$USE_SSL" = "yes" ] && [ -n "$CERT_SOURCE" ] && [ -n "$KEY_SOURCE" ]; then
     echo "📋 Copying configuration and SSL certificates into container..."
     $DOCKER_CMD exec "$CONTAINER_NAME" mkdir -p /config /ssl
     $DOCKER_CMD cp "$CONFIG_DIR/fulcrum.conf" "$CONTAINER_NAME:/config/fulcrum.conf"
-    $DOCKER_CMD cp "$CERT_SOURCE" "$CONTAINER_NAME:/ssl/fullchain.pem"
-    $DOCKER_CMD cp "$KEY_SOURCE" "$CONTAINER_NAME:/ssl/privkey.pem"
+
+    # Let's Encrypt certs are symlinks - dereference them before copying
+    # Use cat to read the actual file content and pipe to container
+    # Use sudo for reading if we needed it for docker (certs require elevated permissions)
+    if [ "$DOCKER_CMD" = "sudo docker" ]; then
+        CAT_CMD="sudo cat"
+    else
+        CAT_CMD="cat"
+    fi
+    echo "📋 Copying SSL certificate (dereferencing symlinks)..."
+    $CAT_CMD "$CERT_SOURCE" | $DOCKER_CMD exec -i "$CONTAINER_NAME" sh -c 'cat > /ssl/fullchain.pem'
+    echo "📋 Copying SSL private key (dereferencing symlinks)..."
+    $CAT_CMD "$KEY_SOURCE" | $DOCKER_CMD exec -i "$CONTAINER_NAME" sh -c 'cat > /ssl/privkey.pem'
+    $DOCKER_CMD exec "$CONTAINER_NAME" chmod 600 /ssl/privkey.pem
+
+    # Signal the entrypoint that all files are ready
+    echo "📋 Signaling entrypoint that configuration is ready..."
+    $DOCKER_CMD exec "$CONTAINER_NAME" touch /tmp/.fulcrum-ready
 else
     echo "🚀 Starting Fulcrum without SSL..."
     echo "📦 Container: $CONTAINER_NAME"
@@ -591,6 +607,10 @@ else
     echo "📋 Copying configuration into container..."
     docker exec "$CONTAINER_NAME" mkdir -p /config
     docker cp "$CONFIG_DIR/fulcrum.conf" "$CONTAINER_NAME:/config/fulcrum.conf"
+
+    # Signal the entrypoint that all files are ready
+    echo "📋 Signaling entrypoint that configuration is ready..."
+    docker exec "$CONTAINER_NAME" touch /tmp/.fulcrum-ready
 fi
 
 # Clean up temporary config directory from host

@@ -115,7 +115,7 @@ public:
     std::optional<quint16> torWss;   ///< corresponds to tor_wss_port in server config -- if unspecified will not announce wss on tor route.
 
     // Max clients per IP related
-    static constexpr int defaultMaxClientsPerIP = 12;
+    static constexpr int defaultMaxClientsPerIP = 256;
     int maxClientsPerIP = defaultMaxClientsPerIP; ///< corresponds to max_clients_per_ip in config file. <= 0 means unlimited.
 
     struct Subnet {

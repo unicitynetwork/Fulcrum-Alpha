@@ -660,6 +660,7 @@ public:
         std::atomic_int64_t bdReqCtr{0}; ///< the number bitcoind requests active right now for all clients coming from this IP address.
         std::atomic_uint64_t bdReqCtr_cum{0}; ///< the number bitcoind requests, cumulatively, for all clients coming from this IP address.
         std::atomic_int64_t lastConnectionLimitReachedWarning{0}; ///< timstamp (in msec) of the last "connection limit exceeded" warning printed to the log for this IP address.
+        std::atomic_int64_t lastActivity{0}; ///< timestamp (in msec) of the last connection activity from this IP. Used for stale PerIPData cleanup.
         /// The cumulative `batch.items.size()` for all batch requests currently active for this IP.
         /// As RPC::BatchProcessors are created this is increased, and as they are deleted this is decreased.
         std::atomic_uint64_t nExtantBatchRequests{0};
@@ -668,6 +669,8 @@ public:
     };
 
     std::shared_ptr<PerIPData> perIPData;
+
+    qint64 createdTime{0}; ///< timestamp (in msec) when this client connection was established. Used for oldest-connection eviction.
 
     QMetaObject::Connection headerSubConnection; ///< if valid, this client is subscribed to headers (`Server::newHeader` signal)
     std::atomic_int nShSubs{0};  ///< the number of unique scripthash subscriptions for this client.

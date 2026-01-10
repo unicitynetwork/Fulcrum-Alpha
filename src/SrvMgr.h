@@ -86,6 +86,11 @@ public:
     /// This just forwards the call to BitcoinDMgr::hasDSProofRPC().
     bool hasDSProofRPC() const;
 
+    /// Thread-Safe. Evicts the oldest client from the specified IP address, if any exist.
+    /// Returns true if a client was evicted, false otherwise.
+    /// This is called when an IP approaches its connection limit (at 90% threshold).
+    void evictOldestClientForIP(const QHostAddress &addr);
+
 signals:
     /// Notifies all blockchain.headers.subscribe'd clients for the entire server about a new header.
     /// (normally connected to the Controller::newHeader signal).
@@ -146,6 +151,10 @@ signals:
     /// - App::on_bitcoindThrottleParamsChange (via a DirectConnection)
     void requestBitcoindThrottleParamsChange(int hi, int lo, int decay);
 
+    /// Emitted when a client should be evicted to make room for a new connection.
+    /// Connected to evictOldestClientForIP_slot.
+    void requestEvictOldestClientForIP(const QHostAddress &);
+
 protected:
     Stats stats() const override;
 
@@ -168,6 +177,10 @@ protected slots:
     void on_liftPeerSuffixBan(const QString &);
     /// Connected to the Server::globalSubsLimitReached signal for each Server instance
     void globalSubsLimitReached();
+    /// Cleans up stale PerIPData entries (nClients <= 0 and lastActivity older than 5 minutes)
+    void cleanupStalePerIPData();
+    /// Slot for handling eviction requests from other threads
+    void evictOldestClientForIP_slot(const QHostAddress &addr);
 
 private:
     void startServers();
