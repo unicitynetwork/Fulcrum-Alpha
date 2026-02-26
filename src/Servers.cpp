@@ -1720,8 +1720,10 @@ QVariantMap ServerBase::unspentItemToVariantMap(const Storage::UnspentItem & ite
     };
     if (item.tokenDataPtr)
         vm.insert(QByteArrayLiteral("token_data"), tokenDataToVariantMap(*item.tokenDataPtr));
-    if (item.coinbaseHeight.has_value())
+    if (item.coinbaseHeight.has_value()) {
         vm.insert(QByteArrayLiteral("coinbase_height"), qlonglong(*item.coinbaseHeight));
+        vm.insert(QByteArrayLiteral("vested"), *item.coinbaseHeight <= BTC::ALPHA_VESTING_THRESHOLD);
+    }
     return vm;
 }
 QVariantList  ServerBase::listUnspentCommon(const HashX &sh, Storage::TokenFilterOption tokenFilter)
