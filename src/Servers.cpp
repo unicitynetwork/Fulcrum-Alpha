@@ -1565,6 +1565,14 @@ QVariantMap ServerBase::getBalanceCommon(const HashX &sh, Storage::TokenFilterOp
         { "confirmed" , qlonglong(amt / amt.satoshi()) },
         { "unconfirmed" , qlonglong(uamt / uamt.satoshi()) },
     };
+    // Alpha vesting: add vested/unvested breakdown
+    if (BTC::coinFromName(storage->getCoin()) == BTC::Coin::ALPHA) {
+        const auto vb = storage->getVestedBalance(sh, tokenFilter);
+        resp.insert("confirmed_vested", qlonglong(vb.confirmedVested / vb.confirmedVested.satoshi()));
+        resp.insert("confirmed_unvested", qlonglong(vb.confirmedUnvested / vb.confirmedUnvested.satoshi()));
+        resp.insert("unconfirmed_vested", qlonglong(vb.unconfirmedVested / vb.unconfirmedVested.satoshi()));
+        resp.insert("unconfirmed_unvested", qlonglong(vb.unconfirmedUnvested / vb.unconfirmedUnvested.satoshi()));
+    }
     return resp;
 }
 
@@ -1712,6 +1720,8 @@ QVariantMap ServerBase::unspentItemToVariantMap(const Storage::UnspentItem & ite
     };
     if (item.tokenDataPtr)
         vm.insert(QByteArrayLiteral("token_data"), tokenDataToVariantMap(*item.tokenDataPtr));
+    if (item.coinbaseHeight.has_value())
+        vm.insert(QByteArrayLiteral("coinbase_height"), qlonglong(*item.coinbaseHeight));
     return vm;
 }
 QVariantList  ServerBase::listUnspentCommon(const HashX &sh, Storage::TokenFilterOption tokenFilter)

@@ -255,6 +255,7 @@ public:
         bitcoin::Amount value;
         TxNum txNum = 0; ///< the global txNum. This + tx_pos defines the order
         bitcoin::token::OutputDataPtr tokenDataPtr; ///< may be null, not null for outputs containing tokens
+        std::optional<BlockHeight> coinbaseHeight; ///< for Alpha vesting: the block height of the originating coinbase tx
 
         // for sort & maps
         bool operator<(const UnspentItem &o) const noexcept;
@@ -270,6 +271,14 @@ public:
 
     /// thread safe -- returns confirmd, unconfirmed balance for a scripthash
     std::pair<bitcoin::Amount, bitcoin::Amount> getBalance(const HashX &, TokenFilterOption) const;
+
+    /// Alpha vesting balance breakdown
+    struct VestedBalance {
+        bitcoin::Amount confirmedVested{bitcoin::Amount::zero()}, confirmedUnvested{bitcoin::Amount::zero()};
+        bitcoin::Amount unconfirmedVested{bitcoin::Amount::zero()}, unconfirmedUnvested{bitcoin::Amount::zero()};
+    };
+    /// thread safe -- returns vested/unvested balance breakdown for Alpha (only meaningful when coin==ALPHA)
+    VestedBalance getVestedBalance(const HashX &, TokenFilterOption) const;
 
     //-- scriptHash first use
     struct FirstUse {

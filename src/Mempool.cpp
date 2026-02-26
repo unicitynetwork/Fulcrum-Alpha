@@ -139,6 +139,7 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
         auto & [tx, ctx] = pair;
         assert(hash == tx->hash);
         IONum inNum = 0;
+        std::optional<BlockHeight> cbHeightFromVin0; // Alpha vesting: capture coinbaseHeight from first input
         TxHashSet seenParents; // DSP handling, otherwise unused if no dsp
         for (const auto & in : ctx->vin) {
             const IONum prevN = IONum(in.prevout.GetN());
@@ -234,6 +235,9 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
                     Debug() << hash.toHex() << " confirmed spend: " << prevTXO.toString() << " " << refPrevInfo.amount.ToString().c_str();
                 }
             }
+            // Alpha vesting: capture coinbaseHeight from the first input (vin[0])
+            if (inNum == 0 && pprevInfo)
+                cbHeightFromVin0 = pprevInfo->coinbaseHeight;
             tx->fee += pprevInfo->amount;
             assert(sh == pprevInfo->hashX);
             this->hashXTxs[sh].push_back(tx); // mark this hashX as having been "touched" because of this input (note we push dupes here out of order but sort and uniqueify at the end)
@@ -264,6 +268,13 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
             }
 
             ++inNum;
+        }
+
+        // Alpha vesting: propagate coinbaseHeight from vin[0] to all outputs of this tx
+        if (cbHeightFromVin0.has_value()) {
+            for (auto & txoInfo : tx->txos)
+                if (txoInfo.isValid())
+                    txoInfo.coinbaseHeight = cbHeightFromVin0;
         }
 
         // Now, compactify some data structures to take up less memory by rehashing thier unordered_maps/unordered_sets..

@@ -114,17 +114,19 @@ struct TXOInfo {
     std::optional<BlockHeight> confirmedHeight; ///< if unset, is mempool tx
     TxNum txNum = 0; ///< the globally mapped txNum (one for each TxHash). This is used to be able to delete the CompactTXO from the hashX's scripthash_unspent table
     bitcoin::token::OutputDataPtr tokenDataPtr; ///< may be null, if not-null, output has token data on it
+    std::optional<BlockHeight> coinbaseHeight; ///< for Alpha vesting: the block height of the originating coinbase tx
 
     bool isValid() const { return amount / bitcoin::Amount::satoshi() >= 0 && hashX.length() == HashLen; }
 
     /// for debug, etc
     bool operator==(const TXOInfo &o) const {
-        return     std::tie(  amount,   hashX,   confirmedHeight,   txNum,   tokenDataPtr)
-                == std::tie(o.amount, o.hashX, o.confirmedHeight, o.txNum, o.tokenDataPtr);
+        return     std::tie(  amount,   hashX,   confirmedHeight,   txNum,   tokenDataPtr,   coinbaseHeight)
+                == std::tie(o.amount, o.hashX, o.confirmedHeight, o.txNum, o.tokenDataPtr, o.coinbaseHeight);
     }
 
 private:
     static inline constexpr BlockHeight kNoBlockHeight = -1; // 0xffffffff; prevous code used int32_t(-1) to indicate no conf height
+    static inline constexpr BlockHeight kNoCoinbaseHeight = 0xfffffffeu; ///< sentinel for "no coinbase height" in serialization
     static_assert(std::numeric_limits<BlockHeight>::max() == std::numeric_limits<uint32_t>::max()
                   && kNoBlockHeight == std::numeric_limits<BlockHeight>::max(), "Ser/Deser assumes this");
 
@@ -135,6 +137,7 @@ public:
         if (!isValid()) return ret;
         const int64_t amt_sats = amount / bitcoin::Amount::satoshi();
         const uint32_t cheight = confirmedHeight.value_or(kNoBlockHeight); // NB: earlier version of this code used int32_t(-1) here to indicate no cheight.
+        const uint32_t cbheight = coinbaseHeight.value_or(kNoCoinbaseHeight);
         const QBASz minSize = static_cast<QBASz>(minSerSize());
         const QBASz rsvSize = minSize + (tokenDataPtr ? 1 + static_cast<QBASz>(tokenDataPtr->EstimatedSerialSize()) : 0);
         ret.reserve(rsvSize);
@@ -147,6 +150,8 @@ public:
         CompactTXO::txNumToCompactBytes(reinterpret_cast<std::byte *>(cur), txNum);
         cur += CompactTXO::compactTxNumSize(); // always 6
         std::memcpy(cur, hashX.constData(), size_t(hashX.length())); // always 32 (enforced by isValid() check above)
+        cur += HashLen;
+        std::memcpy(cur, &cbheight, sizeof(cbheight));
         // NOTE: `cur` may be invalidated below
         BTC::SerializeTokenDataWithPrefix(ret, tokenDataPtr.get());
         return ret;
@@ -155,7 +160,8 @@ public:
     /// `ba` must only contain the valid bytes for this object. Will not tolerate junk bytes at the end.
     static TXOInfo fromBytes(const QByteArray &ba) {
         TXOInfo ret;
-        if (size_t(ba.length()) < minSerSize()) {
+        static constexpr size_t legacyMinSerSize = sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen; // 50
+        if (size_t(ba.length()) < legacyMinSerSize) {
             return ret;
         }
         int64_t amt;
@@ -172,6 +178,15 @@ public:
         ret.amount = amt * bitcoin::Amount::satoshi();
         if (cheight != kNoBlockHeight) // NB: earlier version of this code used int32_t(-1) here to indicate no cheight.
             ret.confirmedHeight.emplace(cheight);
+        // Read coinbaseHeight (4 bytes after hashX). This field is always present in DB v4+.
+        // DB v4 requires full resync so all records in the DB will have this field.
+        if (size_t(ba.length()) >= size_t(cur - ba.constData()) + sizeof(uint32_t)) {
+            uint32_t cbheight;
+            std::memcpy(&cbheight, cur, sizeof(cbheight));
+            cur += sizeof(cbheight);
+            if (cbheight != kNoCoinbaseHeight)
+                ret.coinbaseHeight.emplace(cbheight);
+        }
         try {
             ret.tokenDataPtr = BTC::DeserializeTokenDataWithPrefix(ba, cur - ba.constData());
             if constexpr (false) // Left-in for debugging purposes
@@ -184,5 +199,5 @@ public:
         return ret;
     }
 
-    static constexpr size_t minSerSize() noexcept { return sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen; }
+    static constexpr size_t minSerSize() noexcept { return sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen + sizeof(uint32_t); } // 54 bytes: 8 + 4 + 6 + 32 + 4
 };

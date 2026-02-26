@@ -86,10 +86,11 @@ HistoryTooLarge::~HistoryTooLarge() {} // weak vtable warning suppression
 namespace {
     /// Encapsulates the 'meta' db table
     struct Meta {
-        static constexpr uint32_t kCurrentVersion = 0x3u;
+        static constexpr uint32_t kCurrentVersion = 0x4u;
         static constexpr uint32_t kMinSupportedVersion = 0x1u;
         static constexpr uint32_t kMinBCHUpgrade9Version = 0x2u;
         static constexpr uint32_t kMinHasExtraPlatformInfoVersion = 0x3u;
+        static constexpr uint32_t kMinAlphaVestingVersion = 0x4u;
 
         static constexpr uint32_t kMagic = 0xf33db33fu;
         static constexpr uint16_t kPlatformBits = sizeof(void *)*8U;
@@ -241,7 +242,10 @@ namespace {
         bool valid = false;
         bitcoin::Amount amount;
         bitcoin::token::OutputDataPtr tokenDataPtr;
+        std::optional<BlockHeight> coinbaseHeight; ///< for Alpha vesting
     };
+
+    static constexpr uint32_t kNoCoinbaseHeight = 0xfffffffeu; ///< sentinel for "no coinbase height" in shunspent serialization
 
     // Ensures we store RPA db keys in big endian for faster scans of adjacent heights
     struct RpaDBKey {
@@ -281,7 +285,7 @@ namespace {
     template <> Rpa::PrefixTable Deserialize(const QByteArray &, bool *);
     template <> QByteArray Serialize(const RpaDBKey &k) { return k.toBytes(); }
     template <> RpaDBKey Deserialize(const QByteArray &ba, bool *ok) { return RpaDBKey::fromBytes(ba, ok); }
-    QByteArray Serialize(const bitcoin::Amount &, const bitcoin::token::OutputData *);
+    QByteArray Serialize(const bitcoin::Amount &, const bitcoin::token::OutputData *, std::optional<BlockHeight> coinbaseHeight = std::nullopt);
     template <> SHUnspentValue Deserialize(const QByteArray &, bool *);
     // TxNumVec
     using TxNumVec = std::vector<TxNum>;
@@ -2060,6 +2064,11 @@ void Storage::checkUpgradeDBVersion()
                 << ", bits: " << p->meta.platformBits;
     }
     if (p->meta.version < Meta::kCurrentVersion) {
+        if (BTC::coinFromName(p->meta.coin) == BTC::Coin::ALPHA && p->meta.version < Meta::kMinAlphaVestingVersion) {
+            throw DatabaseError("This datadir was synched using an older version of " APPNAME " which lacked"
+                                " Alpha vesting support (coinbaseHeight tracking).\n\n"
+                                "Please delete the datadir and resynch to the Alpha node.\n");
+        }
         if (BTC::coinFromName(p->meta.coin) == BTC::Coin::BCH && p->meta.version < Meta::kMinBCHUpgrade9Version) {
             // Get the latest header to detect if we are after the activation time
             const Header hdr = headerVerifier().first.lastHeaderProcessed().second;
@@ -3249,7 +3258,7 @@ void Storage::setInitialSync(bool b) {
 void Storage::UTXOBatch::add(const TXO &txo, const TXOInfo &info, const CompactTXO &ctxo)
 {
     const QByteArray shukey = mkShunspentKey(info.hashX, ctxo),
-                     shuval = Serialize(info.amount, info.tokenDataPtr.get());
+                     shuval = Serialize(info.amount, info.tokenDataPtr.get(), info.coinbaseHeight);
     if (!p->cache) {
         // Update db utxoset, keyed off txo -> txoinfo
         static const QString errMsgPrefix("Failed to add a utxo to the utxo batch");
@@ -3511,6 +3520,34 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                         undo->delUndos.reserve(ppb->inputs.size());
                     }
 
+                    // Alpha vesting: build per-tx coinbaseHeight map
+                    std::vector<std::optional<BlockHeight>> txCoinbaseHeights;
+                    const bool isAlpha = BTC::coinFromName(getCoin()) == BTC::Coin::ALPHA;
+                    if (isAlpha) {
+                        txCoinbaseHeights.resize(ppb->txInfos.size());
+                        for (size_t txIdx = 0; txIdx < ppb->txInfos.size(); ++txIdx) {
+                            if (txIdx == 0) {
+                                // Coinbase tx: origin height = this block
+                                txCoinbaseHeights[txIdx] = ppb->height;
+                            } else {
+                                const auto & txInfo = ppb->txInfos[txIdx];
+                                if (!txInfo.input0Index.has_value()) continue;
+                                const auto & firstInput = ppb->inputs[*txInfo.input0Index];
+                                if (firstInput.parentTxOutIdx.has_value()) {
+                                    // In-block spend: inherit from parent tx (already computed, txs are in order)
+                                    txCoinbaseHeights[txIdx] = txCoinbaseHeights[ppb->outputs[*firstInput.parentTxOutIdx].txIdx];
+                                } else {
+                                    // Previous block: look up spent UTXO from cache/DB
+                                    const TXO prevTxo{firstInput.prevoutHash, firstInput.prevoutN};
+                                    std::optional<TXOInfo> prevInfo;
+                                    if (p->db.utxoCache) prevInfo = p->db.utxoCache->get(prevTxo);
+                                    if (!prevInfo) prevInfo = utxoGetFromDB(prevTxo);
+                                    if (prevInfo) txCoinbaseHeights[txIdx] = prevInfo->coinbaseHeight;
+                                }
+                            }
+                        }
+                    }
+
                     // add outputs
                     for (const auto & [hashX, ag] : std::as_const(ppb->hashXAggregated)) {
                         for (const auto oidx : ag.outs) {
@@ -3527,6 +3564,8 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                             info.confirmedHeight = ppb->height;
                             info.txNum = blockTxNum0 + out.txIdx;
                             info.tokenDataPtr = out.tokenDataPtr;
+                            if (isAlpha && out.txIdx < txCoinbaseHeights.size())
+                                info.coinbaseHeight = txCoinbaseHeights[out.txIdx];
                             const TXO txo{ hash, out.outN };
                             const CompactTXO ctxo(info.txNum, txo.outN);
                             utxoBatch.add(txo, info, ctxo); // add to db
@@ -4497,6 +4536,7 @@ auto Storage::listUnspent(const HashX & hashX, const TokenFilterOption tokenFilt
                                         it3->amount,  // .value
                                         TxNum(1) + veryHighTxNum + TxNum(tx->hasUnconfirmedParents() ? 1 : 0), // .txNum (this is fudged for sorting at the end properly)
                                         it3->tokenDataPtr, // .token_data
+                                        it3->coinbaseHeight, // .coinbaseHeight (Alpha vesting)
                                     });
                                 } else {
                                     // this should never happen!
@@ -4559,6 +4599,7 @@ auto Storage::listUnspent(const HashX & hashX, const TokenFilterOption tokenFilt
                         shval.amount, // .value
                         ctxo.txNum(), // .txNum
                         std::move(shval.tokenDataPtr), // .token_data
+                        shval.coinbaseHeight, // .coinbaseHeight (Alpha vesting)
                     });
                 }
             } // end confirmed/db search
@@ -4600,7 +4641,7 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
                 IncrementCtrAndThrowIfExceedsMaxHistory(); // throw if we are iterating too much
                 const CompactTXO ctxo = extractCompactTXOFromShunspentKey(key); // may throw if key has the wrong size, etc
                 bool ok;
-                const auto & [valid, amount, tokenDataPtr] = Deserialize<SHUnspentValue>(FromSlice(iter->value()), &ok);
+                const auto & [valid, amount, tokenDataPtr, cbHeight] = Deserialize<SHUnspentValue>(FromSlice(iter->value()), &ok);
                 if (UNLIKELY(!ok || !valid))
                     throw InternalError(QString("Bad SHUnspentValue in db for ctxo %1 (%2)").arg(ctxo.toString(), QString(hashX.toHex())));
                 if (UNLIKELY(!bitcoin::MoneyRange(amount)))
@@ -4645,6 +4686,81 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
                     }
                 }
                 ret.second = utxos - spends; // note this may not be MoneyRange (may be negative), which is ok.
+            }
+        }
+    } catch (const std::exception &e) {
+        Warning(Log::Magenta) << __func__ << ": " << e.what();
+    }
+    return ret;
+}
+
+auto Storage::getVestedBalance(const HashX &hashX, TokenFilterOption tokenFilter) const -> VestedBalance
+{
+    VestedBalance ret;
+    if (hashX.length() != HashLen)
+        return ret;
+    auto ShouldFilter = [tokenFilter](const bitcoin::token::OutputDataPtr & p) { return ShouldTokenFilter(tokenFilter, p); };
+    auto IncrementCtrAndThrowIfExceedsMaxHistory = GetMaxHistoryCtrFunc("GetVestedBalance UTXOs",
+                                                                        QString("scripthash %1").arg(QString(hashX.toHex())),
+                                                                        options->maxHistory);
+    auto isVested = [](const std::optional<BlockHeight> &cbh) {
+        return cbh.has_value() && *cbh <= BTC::ALPHA_VESTING_THRESHOLD;
+    };
+    try {
+        SharedLockGuard g(p->blocksLock);
+        {
+            // confirmed -- read from db
+            std::unique_ptr<rocksdb::Iterator> iter(p->db.shunspent->NewIterator(p->db.defReadOpts));
+            if (UNLIKELY(!iter)) throw DatabaseError("Unable to obtain an iterator to the shunspent db");
+            const rocksdb::Slice prefix = ToSlice(hashX);
+            rocksdb::Slice key;
+            for (iter->Seek(prefix); iter->Valid() && (key = iter->key()).starts_with(prefix); iter->Next()) {
+                IncrementCtrAndThrowIfExceedsMaxHistory();
+                bool ok;
+                const auto shval = Deserialize<SHUnspentValue>(FromSlice(iter->value()), &ok);
+                if (UNLIKELY(!ok || !shval.valid)) {
+                    auto ctxo = extractCompactTXOFromShunspentKey(key);
+                    throw InternalError(QString("Bad SHUnspentValue in db for ctxo %1 (%2)").arg(ctxo.toString(), QString(hashX.toHex())));
+                }
+                if (ShouldFilter(shval.tokenDataPtr))
+                    continue;
+                if (isVested(shval.coinbaseHeight))
+                    ret.confirmedVested += shval.amount;
+                else
+                    ret.confirmedUnvested += shval.amount;
+            }
+        }
+        {
+            // unconfirmed -- check mempool
+            auto [mempool, lock] = this->mempool();
+            if (auto it = mempool.hashXTxs.find(hashX); it != mempool.hashXTxs.end()) {
+                bitcoin::Amount vestedUtxos, unvestedUtxos, vestedSpends, unvestedSpends;
+                for (const auto & tx : it->second) {
+                    assert(bool(tx));
+                    auto it2 = tx->hashXs.find(hashX);
+                    if (UNLIKELY(it2 == tx->hashXs.end())) continue;
+                    auto & info = it2->second;
+                    IncrementCtrAndThrowIfExceedsMaxHistory(info.confirmedSpends.size() + info.utxo.size());
+                    for (const auto & [txo, txoinfo] : info.confirmedSpends) {
+                        if (ShouldFilter(txoinfo.tokenDataPtr)) continue;
+                        if (isVested(txoinfo.coinbaseHeight))
+                            vestedSpends += txoinfo.amount;
+                        else
+                            unvestedSpends += txoinfo.amount;
+                    }
+                    for (const auto ionum : info.utxo) {
+                        if (decltype(tx->txos.cbegin()) it3;
+                                LIKELY(ionum < tx->txos.size() && (it3 = tx->txos.cbegin() + ionum)->isValid())) {
+                            if (ShouldFilter(it3->tokenDataPtr)) continue;
+                            if (isVested(it3->coinbaseHeight))
+                                vestedUtxos += it3->amount;
+                            else
+                                unvestedUtxos += it3->amount;
+                        }
+                    }
+                }
+                ret.unconfirmedVested = vestedUtxos - vestedSpends;
+                ret.unconfirmedUnvested = unvestedUtxos - unvestedSpends;
             }
         }
     } catch (const std::exception &e) {
@@ -5361,8 +5477,13 @@ namespace {
         return ret;
     }
 
-    QByteArray Serialize(const bitcoin::Amount &a, const bitcoin::token::OutputData *ptok) {
+    QByteArray Serialize(const bitcoin::Amount &a, const bitcoin::token::OutputData *ptok, std::optional<BlockHeight> coinbaseHeight) {
         QByteArray ret = SerializeScalar(a / a.satoshi());
+        // Append coinbaseHeight (4 bytes, sentinel if nullopt)
+        const uint32_t cbh = coinbaseHeight.value_or(kNoCoinbaseHeight);
+        const auto oldSz = ret.size();
+        ret.resize(oldSz + int(sizeof(cbh)));
+        std::memcpy(ret.data() + oldSz, &cbh, sizeof(cbh));
         BTC::SerializeTokenDataWithPrefix(ret, ptok); // may be no-op if ptok is nullptr
         return ret;
     }
@@ -5373,6 +5494,15 @@ namespace {
         SHUnspentValue ret;
         if (ok) {
             ret.amount = amt * bitcoin::Amount::satoshi();
+            // Read coinbaseHeight (4 bytes after amount). This field is always present in DB v4+.
+            // DB v4 requires full resync so all records in the DB will have this field.
+            if (pos + int(sizeof(uint32_t)) <= ba.size()) {
+                uint32_t cbh;
+                std::memcpy(&cbh, ba.constData() + pos, sizeof(cbh));
+                pos += int(sizeof(cbh));
+                if (cbh != kNoCoinbaseHeight)
+                    ret.coinbaseHeight.emplace(cbh);
+            }
             try {
                 ret.tokenDataPtr = BTC::DeserializeTokenDataWithPrefix(ba, pos);
             } catch (const std::exception &e) {
