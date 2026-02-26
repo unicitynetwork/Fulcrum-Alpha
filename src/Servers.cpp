@@ -1557,17 +1557,18 @@ void Server::rpc_blockchain_address_get_balance(Client *c, const RPC::BatchId ba
 
 QVariantMap ServerBase::getBalanceCommon(const HashX &sh, Storage::TokenFilterOption tokenFilter)
 {
-    const auto [amt, uamt] = storage->getBalance(sh, tokenFilter);
+    const bool isAlpha = BTC::coinFromName(storage->getCoin()) == BTC::Coin::ALPHA;
+    const auto bal = storage->getBalance(sh, tokenFilter, isAlpha /* computeVesting */);
     /* Note: ElectrumX protocol docs are incorrect. They claim a string in coin units is returned here.
      * It is not. Instead a number in satoshis is returned!
      * Incorrect docs: https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-scripthash-get-balance */
     QVariantMap resp{
-        { "confirmed" , qlonglong(amt / amt.satoshi()) },
-        { "unconfirmed" , qlonglong(uamt / uamt.satoshi()) },
+        { "confirmed" , qlonglong(bal.confirmed / bal.confirmed.satoshi()) },
+        { "unconfirmed" , qlonglong(bal.unconfirmed / bal.unconfirmed.satoshi()) },
     };
-    // Alpha vesting: add vested/unvested breakdown
-    if (BTC::coinFromName(storage->getCoin()) == BTC::Coin::ALPHA) {
-        const auto vb = storage->getVestedBalance(sh, tokenFilter);
+    // Alpha vesting: add vested/unvested breakdown (computed in the same DB scan)
+    if (bal.vpiBreakdown) {
+        const auto & vb = *bal.vpiBreakdown;
         resp.insert("confirmed_vested", qlonglong(vb.confirmedVested / vb.confirmedVested.satoshi()));
         resp.insert("confirmed_unvested", qlonglong(vb.confirmedUnvested / vb.confirmedUnvested.satoshi()));
         resp.insert("unconfirmed_vested", qlonglong(vb.unconfirmedVested / vb.unconfirmedVested.satoshi()));

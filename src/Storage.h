@@ -269,16 +269,22 @@ public:
     /// return a truncated vector if the overflow is as a result of confirmed+unconfirmed exceeding MaxHistory.
     UnspentItems listUnspent(const HashX &, TokenFilterOption) const;
 
-    /// thread safe -- returns confirmd, unconfirmed balance for a scripthash
-    std::pair<bitcoin::Amount, bitcoin::Amount> getBalance(const HashX &, TokenFilterOption) const;
-
     /// Alpha vesting balance breakdown
     struct VestedBalance {
         bitcoin::Amount confirmedVested{bitcoin::Amount::zero()}, confirmedUnvested{bitcoin::Amount::zero()};
         bitcoin::Amount unconfirmedVested{bitcoin::Amount::zero()}, unconfirmedUnvested{bitcoin::Amount::zero()};
     };
-    /// thread safe -- returns vested/unvested balance breakdown for Alpha (only meaningful when coin==ALPHA)
-    VestedBalance getVestedBalance(const HashX &, TokenFilterOption) const;
+
+    /// Result of getBalance: confirmed + unconfirmed totals, plus optional vesting breakdown
+    struct BalanceResult {
+        bitcoin::Amount confirmed{bitcoin::Amount::zero()};
+        bitcoin::Amount unconfirmed{bitcoin::Amount::zero()};
+        std::optional<VestedBalance> vpiBreakdown; ///< populated when computeVesting is true
+    };
+
+    /// thread safe -- returns confirmed, unconfirmed balance for a scripthash.
+    /// When computeVesting is true, also computes vested/unvested breakdown in a single DB scan.
+    BalanceResult getBalance(const HashX &, TokenFilterOption, bool computeVesting = false) const;
 
     //-- scriptHash first use
     struct FirstUse {

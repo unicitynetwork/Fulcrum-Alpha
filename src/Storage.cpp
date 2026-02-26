@@ -3531,7 +3531,11 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                                 txCoinbaseHeights[txIdx] = ppb->height;
                             } else {
                                 const auto & txInfo = ppb->txInfos[txIdx];
-                                if (!txInfo.input0Index.has_value()) continue;
+                                if (!txInfo.input0Index.has_value()) {
+                                    Warning() << "Alpha vesting: tx " << txIdx << " at height " << ppb->height
+                                              << " has no input0Index, coinbaseHeight will be unknown";
+                                    continue;
+                                }
                                 const auto & firstInput = ppb->inputs[*txInfo.input0Index];
                                 if (firstInput.parentTxOutIdx.has_value()) {
                                     // In-block spend: inherit from parent tx (already computed, txs are in order)
@@ -3542,7 +3546,13 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                                     std::optional<TXOInfo> prevInfo;
                                     if (p->db.utxoCache) prevInfo = p->db.utxoCache->get(prevTxo);
                                     if (!prevInfo) prevInfo = utxoGetFromDB(prevTxo);
-                                    if (prevInfo) txCoinbaseHeights[txIdx] = prevInfo->coinbaseHeight;
+                                    if (prevInfo) {
+                                        txCoinbaseHeights[txIdx] = prevInfo->coinbaseHeight;
+                                    } else {
+                                        Warning() << "Alpha vesting: could not find UTXO " << prevTxo.toString()
+                                                  << " for tx " << txIdx << " at height " << ppb->height
+                                                  << ", coinbaseHeight will be unknown";
+                                    }
                                 }
                             }
                         }
@@ -3571,16 +3581,6 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                             utxoBatch.add(txo, info, ctxo); // add to db
                             if (undo) { // save undo info if we are in saveUndo mode
                                 undo->addUndos.emplace_back(txo, info.hashX, ctxo);
-                            }
-                            
-                            // Debug logging for the specific UTXO that's causing issues
-                            if (ppb->height >= 301000 && hash.toHex() == "f808ce16a52ce075755c3e5e20b087d65179109ef94d0df5d80bb17e6adb216b") {
-                                Debug() << "CREATING TARGET UTXO:";
-                                Debug() << "  Block height: " << ppb->height;
-                                Debug() << "  Creating txid: " << hash.toHex();
-                                Debug() << "  Output number: " << out.outN;
-                                Debug() << "  Amount: " << info.amount.ToString();
-                                Debug() << "  TxNum: " << info.txNum;
                             }
                             
                             if constexpr (debugPrt)
@@ -3637,16 +3637,6 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                                 const auto dbgTxIdHex = ppb->txHashForInputIdx(inum).toHex();
                                 QTextStream ts(&s);
                                 ts << "Failed to spend: " << in.prevoutHash.toHex() << ":" << in.prevoutN << " (spending txid: " << dbgTxIdHex << ")";
-                                
-                                // Debug logging for blocks after 302000 to understand UTXO issues
-                                if (ppb->height >= 301500) {
-                                    Log() << "UTXO FAILURE DEBUG:";
-                                    Log() << "  Block height: " << ppb->height;
-                                    Log() << "  Spending txid: " << dbgTxIdHex;
-                                    Log() << "  Missing UTXO: " << in.prevoutHash.toHex() << ":" << in.prevoutN;
-                                    Log() << "  Input number: " << ppb->numForInputIdx(inum).value_or(0xffff);
-                                    Log() << "  Block has " << ppb->txInfos.size() << " transactions";
-                                }
                             }
                             throw InternalError(s);
                         }
@@ -4616,15 +4606,19 @@ auto Storage::listUnspent(const HashX & hashX, const TokenFilterOption tokenFilt
     return ret;
 }
 
-auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) const -> std::pair<bitcoin::Amount, bitcoin::Amount>
+auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool computeVesting) const -> BalanceResult
 {
-    std::pair<bitcoin::Amount, bitcoin::Amount> ret;
+    BalanceResult ret;
     if (hashX.length() != HashLen)
         return ret;
     auto ShouldFilter = [tokenFilter](const bitcoin::token::OutputDataPtr & p) { return ShouldTokenFilter(tokenFilter, p); };
     auto IncrementCtrAndThrowIfExceedsMaxHistory = GetMaxHistoryCtrFunc("GetBalance UTXOs",
                                                                         QString("scripthash %1").arg(QString(hashX.toHex())),
                                                                         options->maxHistory);
+    VestedBalance vb; // only used when computeVesting is true
+    auto isVested = [](const std::optional<BlockHeight> &cbh) {
+        return cbh.has_value() && *cbh <= BTC::ALPHA_VESTING_THRESHOLD;
+    };
     try {
         // take shared lock (ensure history doesn't mutate from underneath our feet)
         SharedLockGuard g(p->blocksLock);
@@ -4647,11 +4641,17 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
                 if (UNLIKELY(!bitcoin::MoneyRange(amount)))
                     throw InternalError(QString("Out-of-range amount in db for ctxo %1: %2").arg(ctxo.toString()).arg(amount / amount.satoshi()));
                 if ( ! ShouldFilter(tokenDataPtr)) {
-                    ret.first += amount; // tally the result
+                    ret.confirmed += amount; // tally the result
+                    if (computeVesting) {
+                        if (isVested(cbHeight))
+                            vb.confirmedVested += amount;
+                        else
+                            vb.confirmedUnvested += amount;
+                    }
                 }
             }
-            if (UNLIKELY(!bitcoin::MoneyRange(ret.first))) {
-                ret.first = bitcoin::Amount::zero();
+            if (UNLIKELY(!bitcoin::MoneyRange(ret.confirmed))) {
+                ret.confirmed = bitcoin::Amount::zero();
                 throw InternalError(QString("Out-of-range total in db for getBalance on scripthash: %1").arg(QString(hashX.toHex())));
             }
         }
@@ -4661,6 +4661,7 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
             if (auto it = mempool.hashXTxs.find(hashX); it != mempool.hashXTxs.end()) {
                 // for all tx's involving scripthash
                 bitcoin::Amount utxos, spends;
+                bitcoin::Amount vestedUtxos, unvestedUtxos, vestedSpends, unvestedSpends; // only used when computeVesting
                 for (const auto & tx : it->second) {
                     assert(bool(tx));
                     auto it2 = tx->hashXs.find(hashX);
@@ -4671,8 +4672,15 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
                     auto & info = it2->second;
                     IncrementCtrAndThrowIfExceedsMaxHistory(info.confirmedSpends.size() + info.utxo.size()); // throw if >maxHistory
                     for (const auto & [txo, txoinfo] : info.confirmedSpends) {
-                        if ( ! ShouldFilter(txoinfo.tokenDataPtr))
+                        if ( ! ShouldFilter(txoinfo.tokenDataPtr)) {
                             spends += txoinfo.amount;
+                            if (computeVesting) {
+                                if (isVested(txoinfo.coinbaseHeight))
+                                    vestedSpends += txoinfo.amount;
+                                else
+                                    unvestedSpends += txoinfo.amount;
+                            }
+                        }
                     }
                     for (const auto ionum : info.utxo) {
                         if (decltype(tx->txos.cbegin()) it3; UNLIKELY( ionum >= tx->txos.size()
@@ -4682,90 +4690,27 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
                                                 .arg(QString(hashX.toHex()), QString(tx->hash.toHex())).arg(ionum));
                         } else if ( ! ShouldFilter(it3->tokenDataPtr)) {
                             utxos += it3->amount;
+                            if (computeVesting) {
+                                if (isVested(it3->coinbaseHeight))
+                                    vestedUtxos += it3->amount;
+                                else
+                                    unvestedUtxos += it3->amount;
+                            }
                         }
                     }
                 }
-                ret.second = utxos - spends; // note this may not be MoneyRange (may be negative), which is ok.
+                ret.unconfirmed = utxos - spends; // note this may not be MoneyRange (may be negative), which is ok.
+                if (computeVesting) {
+                    vb.unconfirmedVested = vestedUtxos - vestedSpends;
+                    vb.unconfirmedUnvested = unvestedUtxos - unvestedSpends;
+                }
             }
         }
     } catch (const std::exception &e) {
         Warning(Log::Magenta) << __func__ << ": " << e.what();
     }
-    return ret;
-}
-
-auto Storage::getVestedBalance(const HashX &hashX, TokenFilterOption tokenFilter) const -> VestedBalance
-{
-    VestedBalance ret;
-    if (hashX.length() != HashLen)
-        return ret;
-    auto ShouldFilter = [tokenFilter](const bitcoin::token::OutputDataPtr & p) { return ShouldTokenFilter(tokenFilter, p); };
-    auto IncrementCtrAndThrowIfExceedsMaxHistory = GetMaxHistoryCtrFunc("GetVestedBalance UTXOs",
-                                                                        QString("scripthash %1").arg(QString(hashX.toHex())),
-                                                                        options->maxHistory);
-    auto isVested = [](const std::optional<BlockHeight> &cbh) {
-        return cbh.has_value() && *cbh <= BTC::ALPHA_VESTING_THRESHOLD;
-    };
-    try {
-        SharedLockGuard g(p->blocksLock);
-        {
-            // confirmed -- read from db
-            std::unique_ptr<rocksdb::Iterator> iter(p->db.shunspent->NewIterator(p->db.defReadOpts));
-            if (UNLIKELY(!iter)) throw DatabaseError("Unable to obtain an iterator to the shunspent db");
-            const rocksdb::Slice prefix = ToSlice(hashX);
-            rocksdb::Slice key;
-            for (iter->Seek(prefix); iter->Valid() && (key = iter->key()).starts_with(prefix); iter->Next()) {
-                IncrementCtrAndThrowIfExceedsMaxHistory();
-                bool ok;
-                const auto shval = Deserialize<SHUnspentValue>(FromSlice(iter->value()), &ok);
-                if (UNLIKELY(!ok || !shval.valid)) {
-                    auto ctxo = extractCompactTXOFromShunspentKey(key);
-                    throw InternalError(QString("Bad SHUnspentValue in db for ctxo %1 (%2)").arg(ctxo.toString(), QString(hashX.toHex())));
-                }
-                if (ShouldFilter(shval.tokenDataPtr))
-                    continue;
-                if (isVested(shval.coinbaseHeight))
-                    ret.confirmedVested += shval.amount;
-                else
-                    ret.confirmedUnvested += shval.amount;
-            }
-        }
-        {
-            // unconfirmed -- check mempool
-            auto [mempool, lock] = this->mempool();
-            if (auto it = mempool.hashXTxs.find(hashX); it != mempool.hashXTxs.end()) {
-                bitcoin::Amount vestedUtxos, unvestedUtxos, vestedSpends, unvestedSpends;
-                for (const auto & tx : it->second) {
-                    assert(bool(tx));
-                    auto it2 = tx->hashXs.find(hashX);
-                    if (UNLIKELY(it2 == tx->hashXs.end())) continue;
-                    auto & info = it2->second;
-                    IncrementCtrAndThrowIfExceedsMaxHistory(info.confirmedSpends.size() + info.utxo.size());
-                    for (const auto & [txo, txoinfo] : info.confirmedSpends) {
-                        if (ShouldFilter(txoinfo.tokenDataPtr)) continue;
-                        if (isVested(txoinfo.coinbaseHeight))
-                            vestedSpends += txoinfo.amount;
-                        else
-                            unvestedSpends += txoinfo.amount;
-                    }
-                    for (const auto ionum : info.utxo) {
-                        if (decltype(tx->txos.cbegin()) it3;
-                                LIKELY(ionum < tx->txos.size() && (it3 = tx->txos.cbegin() + ionum)->isValid())) {
-                            if (ShouldFilter(it3->tokenDataPtr)) continue;
-                            if (isVested(it3->coinbaseHeight))
-                                vestedUtxos += it3->amount;
-                            else
-                                unvestedUtxos += it3->amount;
-                        }
-                    }
-                }
-                ret.unconfirmedVested = vestedUtxos - vestedSpends;
-                ret.unconfirmedUnvested = unvestedUtxos - unvestedSpends;
-            }
-        }
-    } catch (const std::exception &e) {
-        Warning(Log::Magenta) << __func__ << ": " << e.what();
-    }
+    if (computeVesting)
+        ret.vpiBreakdown = vb;
     return ret;
 }
 
