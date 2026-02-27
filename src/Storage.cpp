@@ -245,7 +245,7 @@ namespace {
         std::optional<BlockHeight> coinbaseHeight; ///< for Alpha vesting
     };
 
-    static constexpr uint32_t kNoCoinbaseHeight = 0xfffffffeu; ///< sentinel for "no coinbase height" in shunspent serialization
+    static constexpr uint32_t kNoCoinbaseHeight = TXOInfo::kNoCoinbaseHeight; ///< alias for TXOInfo sentinel
 
     // Ensures we store RPA db keys in big endian for faster scans of adjacent heights
     struct RpaDBKey {
@@ -4708,6 +4708,7 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool
         }
     } catch (const std::exception &e) {
         Warning(Log::Magenta) << __func__ << ": " << e.what();
+        vb = VestedBalance{}; // reset vesting breakdown on error to maintain confirmed == vested + unvested invariant
     }
     if (computeVesting)
         ret.vpiBreakdown = vb;
@@ -5443,9 +5444,14 @@ namespace {
         SHUnspentValue ret;
         if (ok) {
             ret.amount = amt * bitcoin::Amount::satoshi();
-            // Read coinbaseHeight (4 bytes after amount). This field is always present in DB v4+.
-            // DB v4 requires full resync so all records in the DB will have this field.
-            if (pos + int(sizeof(uint32_t)) <= ba.size()) {
+            // Read coinbaseHeight (4 bytes after amount) if present.
+            // Detect old-format records (pre-v4, no coinbaseHeight) by checking if the next byte is the
+            // CashToken prefix (0xef). Old records go straight from amount to token data; new records
+            // have 4 bytes of coinbaseHeight first. Records with no token data and no coinbaseHeight
+            // are exactly 8 bytes (amount only), so the size check handles that case.
+            const bool hasTokenPrefixNext = pos < ba.size()
+                                            && static_cast<uint8_t>(ba.constData()[pos]) == bitcoin::token::PREFIX_BYTE;
+            if (!hasTokenPrefixNext && pos + int(sizeof(uint32_t)) <= ba.size()) {
                 uint32_t cbh;
                 std::memcpy(&cbh, ba.constData() + pos, sizeof(cbh));
                 pos += int(sizeof(cbh));

@@ -292,21 +292,26 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
             changed = false;
             for (auto & [hash, pair] : txsNew) {
                 auto & [tx, ctx] = pair;
-                // Check if this tx's outputs lack coinbaseHeight but its vin[0] parent now has it
-                if (!tx->txos.empty() && tx->txos[0].isValid() && !tx->txos[0].coinbaseHeight.has_value()) {
+                // Check if any valid output lacks coinbaseHeight (can't just check txos[0] — it may be OP_RETURN)
+                bool needsFixup = false;
+                for (const auto & txoInfo : tx->txos) {
+                    if (txoInfo.isValid() && !txoInfo.coinbaseHeight.has_value()) {
+                        needsFixup = true;
+                        break;
+                    }
+                }
+                if (needsFixup && !ctx->vin.empty()) {
                     // Look up vin[0]'s parent
-                    if (!ctx->vin.empty()) {
-                        const TxHash prevTxId = BTC::Hash2ByteArrayRev(ctx->vin[0].prevout.GetTxId());
-                        const IONum prevN = IONum(ctx->vin[0].prevout.GetN());
-                        if (auto it = this->txs.find(prevTxId); it != this->txs.end()) {
-                            auto prevTxRef = it->second;
-                            if (prevN < prevTxRef->txos.size() && prevTxRef->txos[prevN].coinbaseHeight.has_value()) {
-                                const auto cbHeight = prevTxRef->txos[prevN].coinbaseHeight;
-                                for (auto & txoInfo : tx->txos)
-                                    if (txoInfo.isValid())
-                                        txoInfo.coinbaseHeight = cbHeight;
-                                changed = true;
-                            }
+                    const TxHash prevTxId = BTC::Hash2ByteArrayRev(ctx->vin[0].prevout.GetTxId());
+                    const IONum prevN = IONum(ctx->vin[0].prevout.GetN());
+                    if (auto it = this->txs.find(prevTxId); it != this->txs.end()) {
+                        auto prevTxRef = it->second;
+                        if (prevN < prevTxRef->txos.size() && prevTxRef->txos[prevN].coinbaseHeight.has_value()) {
+                            const auto cbHeight = prevTxRef->txos[prevN].coinbaseHeight;
+                            for (auto & txoInfo : tx->txos)
+                                if (txoInfo.isValid())
+                                    txoInfo.coinbaseHeight = cbHeight;
+                            changed = true;
                         }
                     }
                 }

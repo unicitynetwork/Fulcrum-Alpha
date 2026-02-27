@@ -124,9 +124,11 @@ struct TXOInfo {
                 == std::tie(o.amount, o.hashX, o.confirmedHeight, o.txNum, o.tokenDataPtr, o.coinbaseHeight);
     }
 
+    /// Sentinel for "no coinbase height" in serialization. Public so Storage.cpp can reference the same constant.
+    static inline constexpr BlockHeight kNoCoinbaseHeight = 0xfffffffeu;
+
 private:
     static inline constexpr BlockHeight kNoBlockHeight = -1; // 0xffffffff; prevous code used int32_t(-1) to indicate no conf height
-    static inline constexpr BlockHeight kNoCoinbaseHeight = 0xfffffffeu; ///< sentinel for "no coinbase height" in serialization
     static_assert(std::numeric_limits<BlockHeight>::max() == std::numeric_limits<uint32_t>::max()
                   && kNoBlockHeight == std::numeric_limits<BlockHeight>::max(), "Ser/Deser assumes this");
 
@@ -178,9 +180,13 @@ public:
         ret.amount = amt * bitcoin::Amount::satoshi();
         if (cheight != kNoBlockHeight) // NB: earlier version of this code used int32_t(-1) here to indicate no cheight.
             ret.confirmedHeight.emplace(cheight);
-        // Read coinbaseHeight (4 bytes after hashX). This field is always present in DB v4+.
-        // DB v4 requires full resync so all records in the DB will have this field.
-        if (size_t(ba.length()) >= size_t(cur - ba.constData()) + sizeof(uint32_t)) {
+        // Read coinbaseHeight (4 bytes after hashX) if present.
+        // Detect old-format records (pre-v4, no coinbaseHeight) by checking if the next byte is
+        // the CashToken prefix (0xef). Old records go straight from hashX to token data; new
+        // records have 4 bytes of coinbaseHeight first.
+        const bool hasTokenPrefixNext = cur < ba.constData() + ba.length()
+                                        && static_cast<uint8_t>(*cur) == bitcoin::token::PREFIX_BYTE;
+        if (!hasTokenPrefixNext && size_t(ba.length()) >= size_t(cur - ba.constData()) + sizeof(uint32_t)) {
             uint32_t cbheight;
             std::memcpy(&cbheight, cur, sizeof(cbheight));
             cur += sizeof(cbheight);

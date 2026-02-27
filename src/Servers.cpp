@@ -1557,7 +1557,7 @@ void Server::rpc_blockchain_address_get_balance(Client *c, const RPC::BatchId ba
 
 QVariantMap ServerBase::getBalanceCommon(const HashX &sh, Storage::TokenFilterOption tokenFilter)
 {
-    const bool isAlpha = BTC::coinFromName(storage->getCoin()) == BTC::Coin::ALPHA;
+    const bool isAlpha = coin == BTC::Coin::ALPHA; // use cached member, avoid redundant lock on storage->getCoin()
     const auto bal = storage->getBalance(sh, tokenFilter, isAlpha /* computeVesting */);
     /* Note: ElectrumX protocol docs are incorrect. They claim a string in coin units is returned here.
      * It is not. Instead a number in satoshis is returned!
@@ -1725,6 +1725,9 @@ QVariantMap ServerBase::unspentItemToVariantMap(const Storage::UnspentItem & ite
         vm.insert(QByteArrayLiteral("coinbase_height"), qlonglong(*item.coinbaseHeight));
         vm.insert(QByteArrayLiteral("vested"), *item.coinbaseHeight <= BTC::ALPHA_VESTING_THRESHOLD);
     }
+    // Note: when coinbaseHeight is nullopt (unknown ancestry or non-Alpha), vested/coinbase_height
+    // fields are omitted. get_balance counts such UTXOs as unvested. Clients should treat absence
+    // of the vested field as "unvested" for Alpha.
     return vm;
 }
 QVariantList  ServerBase::listUnspentCommon(const HashX &sh, Storage::TokenFilterOption tokenFilter)
