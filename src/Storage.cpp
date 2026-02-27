@@ -2338,6 +2338,13 @@ void Storage::setCoin(const QString &coin) {
     }
     if (!coin.isEmpty())
         Log() << "Coin: " << coin;
+    // Update the coinbaseHeight serialization flags. This is critical when the coin
+    // is detected AFTER Storage::startup() (e.g., when meta was cleaned and the coin
+    // is first determined by Controller connecting to the node). Without this, the
+    // flags remain false and coinbaseHeight is never serialized despite being computed.
+    const bool isAlpha = BTC::coinFromName(coin) == BTC::Coin::ALPHA;
+    s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release);
+    TXOInfo::s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release);
     save(SaveItem::Meta);
 }
 
