@@ -143,7 +143,7 @@ public:
         QByteArray ret;
         using QBASz = QByteArray::size_type;
         if (!isValid()) return ret;
-        const bool writeCbHeight = s_coinHasCoinbaseHeight.load(std::memory_order_relaxed);
+        const bool writeCbHeight = s_coinHasCoinbaseHeight.load(std::memory_order_acquire);
         const int64_t amt_sats = amount / bitcoin::Amount::satoshi();
         const uint32_t cheight = confirmedHeight.value_or(kNoBlockHeight); // NB: earlier version of this code used int32_t(-1) here to indicate no cheight.
         const QBASz serSize = static_cast<QBASz>(writeCbHeight ? minSerSize() : legacyMinSerSize());
@@ -192,7 +192,7 @@ public:
         // Read coinbaseHeight (4 bytes after hashX) only when the coin is Alpha.
         // On Alpha, DB v4 was created from a full resync so ALL utxoset and undo records include
         // coinbaseHeight. On non-Alpha (BCH/BTC/LTC), the field is never written, so we never read it.
-        if (s_coinHasCoinbaseHeight.load(std::memory_order_relaxed)
+        if (s_coinHasCoinbaseHeight.load(std::memory_order_acquire)
                 && size_t(ba.length()) >= size_t(cur - ba.constData()) + sizeof(uint32_t)) {
             uint32_t cbheight;
             std::memcpy(&cbheight, cur, sizeof(cbheight));

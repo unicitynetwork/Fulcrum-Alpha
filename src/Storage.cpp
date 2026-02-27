@@ -2026,8 +2026,24 @@ void Storage::startup()
         }
     }
 
+    // Set the coinbaseHeight serialization flags BEFORE any deserialization occurs.
+    // This must happen immediately after meta loading so that loadCheckUTXOsInDB() (with --checkdb)
+    // and loadCheckShunspentInDB() (with -C -C) correctly handle the 4-byte coinbaseHeight field.
+    // Alpha forces a full resync to v4, so all records have the field. Non-Alpha (BCH/BTC/LTC) never writes it.
+    {
+        const bool isAlpha = BTC::coinFromName(getCoin()) == BTC::Coin::ALPHA;
+        s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release); // anonymous namespace flag for SHUnspentValue
+        TXOInfo::s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release); // TXOInfo flag for utxoset/undo records
+    }
+
     // load headers -- may throw.. this must come first
     loadCheckHeadersInDB();
+
+    // Detect old DB version and see if upgrade is permitted, and maybe do a DB upgrade...
+    // Must run before loadCheckUTXOsInDB() so that old Alpha DBs get a friendly error message
+    // instead of a confusing deserialization crash.
+    checkUpgradeDBVersion();
+
     // check txnums
     loadCheckTxNumsFileAndBlkInfo();
     // construct the TxHash2TxNum manager -- depends on the above function having constructed the txNumFile
@@ -2045,19 +2061,6 @@ void Storage::startup()
 
     // start up the co-task we use in addBlock and undoLatestBlock
     p->blocksWorker = std::make_unique<CoTask>("Storage Worker");
-
-    // Detect old DB version and see if upgrade is permitted, and maybe do a DB upgrade...
-    checkUpgradeDBVersion();
-
-    // Set the flags that control whether serialized records include coinbaseHeight.
-    // Alpha forces a full resync to v4, so all records have the field. Non-Alpha (BCH/BTC/LTC) never writes it.
-    // This eliminates the fundamentally broken heuristic of trying to distinguish coinbaseHeight bytes from
-    // the CashToken prefix byte (0xef) — any height where height%256==239 has 0xef as its first byte.
-    {
-        const bool isAlpha = BTC::coinFromName(getCoin()) == BTC::Coin::ALPHA;
-        s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_relaxed); // anonymous namespace flag for SHUnspentValue
-        TXOInfo::s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_relaxed); // TXOInfo flag for utxoset/undo records
-    }
 
     start(); // starts our thread
 }
@@ -4632,6 +4635,7 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool
                                                                         QString("scripthash %1").arg(QString(hashX.toHex())),
                                                                         options->maxHistory);
     VestedBalance vb; // only used when computeVesting is true
+    bool confirmedVestingOk = false; // set to true after confirmed scan completes successfully
     auto isVested = [](const std::optional<BlockHeight> &cbh) {
         return cbh.has_value() && *cbh <= BTC::ALPHA_VESTING_THRESHOLD;
     };
@@ -4670,6 +4674,8 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool
                 ret.confirmed = bitcoin::Amount::zero();
                 throw InternalError(QString("Out-of-range total in db for getBalance on scripthash: %1").arg(QString(hashX.toHex())));
             }
+            // Confirmed vesting is complete here — save it so it can survive a mempool exception.
+            confirmedVestingOk = true;
         }
         {
             // unconfirmed -- check mempool
@@ -4724,9 +4730,16 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool
         }
     } catch (const std::exception &e) {
         Warning(Log::Magenta) << __func__ << ": " << e.what();
-        // Suppress vesting breakdown entirely on error — returning zeros would violate the
-        // confirmed == vested + unvested invariant that clients expect.
-        computeVesting = false;
+        if (computeVesting) {
+            if (confirmedVestingOk) {
+                // Confirmed vesting data is complete. Zero out unconfirmed vesting since we can't trust it.
+                vb.unconfirmedVested = bitcoin::Amount::zero();
+                vb.unconfirmedUnvested = bitcoin::Amount::zero();
+            } else {
+                // Confirmed vesting scan also failed — suppress vesting breakdown entirely.
+                computeVesting = false;
+            }
+        }
     }
     if (computeVesting)
         ret.vpiBreakdown = vb;
@@ -5449,7 +5462,7 @@ namespace {
         QByteArray ret = SerializeScalar(a / a.satoshi());
         // Only write coinbaseHeight for Alpha (s_coinHasCoinbaseHeight). For BCH/BTC/LTC, the field is omitted
         // entirely, avoiding the ambiguity of discriminating coinbaseHeight bytes from CashToken prefix (0xef).
-        if (s_coinHasCoinbaseHeight.load(std::memory_order_relaxed)) {
+        if (s_coinHasCoinbaseHeight.load(std::memory_order_acquire)) {
             const uint32_t cbh = coinbaseHeight.value_or(kNoCoinbaseHeight);
             const auto oldSz = ret.size();
             ret.resize(oldSz + int(sizeof(cbh)));
@@ -5471,12 +5484,19 @@ namespace {
             // This avoids the fundamentally broken heuristic of trying to distinguish coinbaseHeight
             // bytes from the CashToken prefix byte (0xef) — any coinbaseHeight where height%256==239
             // (e.g. 239, 495, 751, ..., 280303) has 0xef as its first byte in little-endian.
-            if (s_coinHasCoinbaseHeight.load(std::memory_order_relaxed) && pos + int(sizeof(uint32_t)) <= ba.size()) {
-                uint32_t cbh;
-                std::memcpy(&cbh, ba.constData() + pos, sizeof(cbh));
-                pos += int(sizeof(cbh));
-                if (cbh != kNoCoinbaseHeight)
-                    ret.coinbaseHeight.emplace(cbh);
+            if (s_coinHasCoinbaseHeight.load(std::memory_order_acquire)) {
+                if (UNLIKELY(pos + int(sizeof(uint32_t)) > ba.size())) {
+                    // This should never happen on Alpha v4 DB — all records should have coinbaseHeight.
+                    // A truncated record indicates corruption.
+                    Warning() << "SHUnspentValue::Deserialize: Alpha record missing coinbaseHeight field"
+                              << " (size=" << ba.size() << ", expected >=" << (pos + int(sizeof(uint32_t))) << ")";
+                } else {
+                    uint32_t cbh;
+                    std::memcpy(&cbh, ba.constData() + pos, sizeof(cbh));
+                    pos += int(sizeof(cbh));
+                    if (cbh != kNoCoinbaseHeight)
+                        ret.coinbaseHeight.emplace(cbh);
+                }
             }
             try {
                 ret.tokenDataPtr = BTC::DeserializeTokenDataWithPrefix(ba, pos);
