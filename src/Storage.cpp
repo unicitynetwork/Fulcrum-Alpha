@@ -4674,6 +4674,11 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool
                 ret.confirmed = bitcoin::Amount::zero();
                 throw InternalError(QString("Out-of-range total in db for getBalance on scripthash: %1").arg(QString(hashX.toHex())));
             }
+            if (computeVesting && UNLIKELY(!bitcoin::MoneyRange(vb.confirmedVested) || !bitcoin::MoneyRange(vb.confirmedUnvested))) {
+                Warning() << __func__ << ": Out-of-range vested/unvested total for scripthash: " << hashX.toHex();
+                vb.confirmedVested = bitcoin::Amount::zero();
+                vb.confirmedUnvested = bitcoin::Amount::zero();
+            }
             // Confirmed vesting is complete here — save it so it can survive a mempool exception.
             confirmedVestingOk = true;
         }

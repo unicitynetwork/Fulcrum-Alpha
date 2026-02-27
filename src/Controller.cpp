@@ -1867,9 +1867,10 @@ auto Controller::debug(const StatsParams &p) const -> Stats // from StatsMixin
     if (const auto hashx = QByteArray::fromHex(p.value("unspent").toLatin1()); hashx.length() == HashLen) {
         QVariantList l;
 
+        const bool isAlpha = BTC::coinFromName(storage->getCoin()) == BTC::Coin::ALPHA;
         const auto items = storage->listUnspent(hashx, Storage::TokenFilterOption::IncludeTokens);
         for (const auto & item : items)
-            l.push_back(Server::unspentItemToVariantMap(item));
+            l.push_back(Server::unspentItemToVariantMap(item, isAlpha));
         ret["unspent_debug"] = l;
     }
     if (p.contains("utxo_stats")) {

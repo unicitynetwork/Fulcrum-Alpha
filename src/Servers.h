@@ -332,7 +332,9 @@ protected:
 public:
     /// Helper function called by blockchain.scripthash.listunspent RPC and by the Controller class for /debug/
     /// @returns A QVariantMap that matches the output of `blockchain.scripthash.listunspent`
-    [[nodiscard]] static QVariantMap unspentItemToVariantMap(const Storage::UnspentItem &);
+    /// @param isAlpha When true, emits `vested` and `coinbase_height` fields. When false (default), vesting
+    ///                fields are omitted even if coinbaseHeight has a value, preventing wrong-coin threshold use.
+    [[nodiscard]] static QVariantMap unspentItemToVariantMap(const Storage::UnspentItem &, bool isAlpha = false);
 };
 
 /// Implements the Electrum Cash JSON-RPC protocol: https://electrum-cash-protocol.readthedocs.io/en/latest/index.html

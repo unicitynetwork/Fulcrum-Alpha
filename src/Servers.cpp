@@ -1711,7 +1711,7 @@ void Server::rpc_blockchain_address_listunspent(Client *c, const RPC::BatchId ba
     impl_listunspent(c, batchId, m, sh, tf);
 }
 /* static */
-QVariantMap ServerBase::unspentItemToVariantMap(const Storage::UnspentItem & item)
+QVariantMap ServerBase::unspentItemToVariantMap(const Storage::UnspentItem & item, bool isAlpha)
 {
     QVariantMap vm{
         { QByteArrayLiteral("tx_hash") , Util::ToHexFast(item.hash) },
@@ -1721,22 +1721,27 @@ QVariantMap ServerBase::unspentItemToVariantMap(const Storage::UnspentItem & ite
     };
     if (item.tokenDataPtr)
         vm.insert(QByteArrayLiteral("token_data"), tokenDataToVariantMap(*item.tokenDataPtr));
-    if (item.coinbaseHeight.has_value()) {
-        vm.insert(QByteArrayLiteral("coinbase_height"), qlonglong(*item.coinbaseHeight));
-        vm.insert(QByteArrayLiteral("vested"), *item.coinbaseHeight <= BTC::ALPHA_VESTING_THRESHOLD);
+    if (isAlpha) {
+        // Always emit the vested field on Alpha for protocol consistency with get_balance (which counts
+        // unknown-ancestry UTXOs as unvested). This ensures clients can sum listunspent vested fields
+        // to match confirmed_vested/confirmed_unvested from get_balance.
+        if (item.coinbaseHeight.has_value()) {
+            vm.insert(QByteArrayLiteral("coinbase_height"), qlonglong(*item.coinbaseHeight));
+            vm.insert(QByteArrayLiteral("vested"), *item.coinbaseHeight <= BTC::ALPHA_VESTING_THRESHOLD);
+        } else {
+            vm.insert(QByteArrayLiteral("vested"), false);
+        }
     }
-    // Note: when coinbaseHeight is nullopt (unknown ancestry or non-Alpha), vested/coinbase_height
-    // fields are omitted. get_balance counts such UTXOs as unvested. Clients should treat absence
-    // of the vested field as "unvested" for Alpha.
     return vm;
 }
 QVariantList  ServerBase::listUnspentCommon(const HashX &sh, Storage::TokenFilterOption tokenFilter)
 {
     QVariantList resp;
+    const bool isAlpha = coin == BTC::Coin::ALPHA;
     const auto items = storage->listUnspent(sh, tokenFilter); // these are already sorted
     resp.reserve(items.size());
     for (const auto & item : items)
-        resp.push_back(unspentItemToVariantMap(item));
+        resp.push_back(unspentItemToVariantMap(item, isAlpha));
     return resp;
 }
 void Server::impl_listunspent(Client *c, const RPC::BatchId batchId, const RPC::Message &m, const HashX &sh,
