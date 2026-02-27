@@ -510,6 +510,7 @@ bitcoind = $RPC_HOST:$RPC_PORT
 rpcuser = $RPC_USER
 rpcpassword = $RPC_PASS
 tcp = 0.0.0.0:50001
+ws = 0.0.0.0:50003
 peering = false
 admin = 8000
 stats = 8080

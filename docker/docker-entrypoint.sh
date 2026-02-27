@@ -353,6 +353,12 @@ run_fulcrum_supervised() {
 echo "🧹 Cleaning database on startup to ensure fresh state..."
 clean_database
 
+# Clean stale config and SSL from previous runs so the ready-signal handshake
+# with run-fulcrum.sh always runs fresh. Without this, a leftover /config/fulcrum.conf
+# causes wait_for_ready_signal() to skip waiting, and SSL certs from a new run
+# arrive after the entrypoint has already started Fulcrum without them.
+rm -f /config/fulcrum.conf /ssl/fullchain.pem /ssl/privkey.pem /ssl/fulcrum.crt /ssl/fulcrum.key 2>/dev/null || true
+
 # Wait for run script to finish copying config and SSL certs
 wait_for_ready_signal
 
