@@ -52,6 +52,9 @@ namespace BTC
     
     /// The block height at which Alpha chain became mixed (SHA256 + RandomX)
     static constexpr int ALPHA_MIXED_CHAIN_HEIGHT = 301101;
+
+    /// Coinbase UTXOs mined at or before this height are considered "vested" in Alpha
+    static constexpr uint32_t ALPHA_VESTING_THRESHOLD = 280000;
     
     /// Helper function to determine if a block is a RandomX block based on height
     /// Note: This is a fallback for height-based detection. The proper way is to check the version bit.

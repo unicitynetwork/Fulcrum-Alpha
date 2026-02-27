@@ -86,10 +86,11 @@ HistoryTooLarge::~HistoryTooLarge() {} // weak vtable warning suppression
 namespace {
     /// Encapsulates the 'meta' db table
     struct Meta {
-        static constexpr uint32_t kCurrentVersion = 0x3u;
+        static constexpr uint32_t kCurrentVersion = 0x4u;
         static constexpr uint32_t kMinSupportedVersion = 0x1u;
         static constexpr uint32_t kMinBCHUpgrade9Version = 0x2u;
         static constexpr uint32_t kMinHasExtraPlatformInfoVersion = 0x3u;
+        static constexpr uint32_t kMinAlphaVestingVersion = 0x4u;
 
         static constexpr uint32_t kMagic = 0xf33db33fu;
         static constexpr uint16_t kPlatformBits = sizeof(void *)*8U;
@@ -241,7 +242,14 @@ namespace {
         bool valid = false;
         bitcoin::Amount amount;
         bitcoin::token::OutputDataPtr tokenDataPtr;
+        std::optional<BlockHeight> coinbaseHeight; ///< for Alpha vesting
     };
+
+    static constexpr uint32_t kNoCoinbaseHeight = TXOInfo::kNoCoinbaseHeight; ///< alias for TXOInfo sentinel
+
+    /// Reference to the single authoritative flag in TXOInfo. Both SHUnspentValue and TXOInfo
+    /// serialization use this same flag, eliminating the risk of two flags getting out of sync.
+    auto &s_coinHasCoinbaseHeight = TXOInfo::s_coinHasCoinbaseHeight;
 
     // Ensures we store RPA db keys in big endian for faster scans of adjacent heights
     struct RpaDBKey {
@@ -281,7 +289,7 @@ namespace {
     template <> Rpa::PrefixTable Deserialize(const QByteArray &, bool *);
     template <> QByteArray Serialize(const RpaDBKey &k) { return k.toBytes(); }
     template <> RpaDBKey Deserialize(const QByteArray &ba, bool *ok) { return RpaDBKey::fromBytes(ba, ok); }
-    QByteArray Serialize(const bitcoin::Amount &, const bitcoin::token::OutputData *);
+    QByteArray Serialize(const bitcoin::Amount &, const bitcoin::token::OutputData *, std::optional<BlockHeight> coinbaseHeight = std::nullopt);
     template <> SHUnspentValue Deserialize(const QByteArray &, bool *);
     // TxNumVec
     using TxNumVec = std::vector<TxNum>;
@@ -2016,8 +2024,24 @@ void Storage::startup()
         }
     }
 
+    // Set the coinbaseHeight serialization flag BEFORE any deserialization occurs.
+    // This must happen immediately after meta loading so that loadCheckUTXOsInDB() (with --checkdb)
+    // and loadCheckShunspentInDB() (with -C -C) correctly handle the 4-byte coinbaseHeight field.
+    // Alpha forces a full resync to v4, so all records have the field. Non-Alpha (BCH/BTC/LTC) never writes it.
+    // Note: s_coinHasCoinbaseHeight is a reference to TXOInfo::s_coinHasCoinbaseHeight — single flag for both.
+    {
+        const bool isAlpha = BTC::coinFromName(getCoin()) == BTC::Coin::ALPHA;
+        s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release);
+    }
+
     // load headers -- may throw.. this must come first
     loadCheckHeadersInDB();
+
+    // Detect old DB version and see if upgrade is permitted, and maybe do a DB upgrade...
+    // Must run before loadCheckUTXOsInDB() so that old Alpha DBs get a friendly error message
+    // instead of a confusing deserialization crash.
+    checkUpgradeDBVersion();
+
     // check txnums
     loadCheckTxNumsFileAndBlkInfo();
     // construct the TxHash2TxNum manager -- depends on the above function having constructed the txNumFile
@@ -2035,9 +2059,6 @@ void Storage::startup()
 
     // start up the co-task we use in addBlock and undoLatestBlock
     p->blocksWorker = std::make_unique<CoTask>("Storage Worker");
-
-    // Detect old DB version and see if upgrade is permitted, and maybe do a DB upgrade...
-    checkUpgradeDBVersion();
 
     start(); // starts our thread
 }
@@ -2060,6 +2081,11 @@ void Storage::checkUpgradeDBVersion()
                 << ", bits: " << p->meta.platformBits;
     }
     if (p->meta.version < Meta::kCurrentVersion) {
+        if (BTC::coinFromName(p->meta.coin) == BTC::Coin::ALPHA && p->meta.version < Meta::kMinAlphaVestingVersion) {
+            throw DatabaseError("This datadir was synched using an older version of " APPNAME " which lacked"
+                                " Alpha vesting support (coinbaseHeight tracking).\n\n"
+                                "Please delete the datadir and resynch to the Alpha node.\n");
+        }
         if (BTC::coinFromName(p->meta.coin) == BTC::Coin::BCH && p->meta.version < Meta::kMinBCHUpgrade9Version) {
             // Get the latest header to detect if we are after the activation time
             const Header hdr = headerVerifier().first.lastHeaderProcessed().second;
@@ -2085,8 +2111,15 @@ void Storage::checkUpgradeDBVersion()
             }
         }
 
-        Log() << "DB version is older but compatible, updating version to v" << Meta::kCurrentVersion << " ...";
-        p->meta.version = Meta::kCurrentVersion;
+        // Only bump to v4 for Alpha (which needs coinbaseHeight tracking). Non-Alpha coins
+        // stay at v3 to avoid locking out rollback to upstream Fulcrum which only knows v3.
+        const auto targetVersion = (BTC::coinFromName(p->meta.coin) == BTC::Coin::ALPHA)
+                                   ? Meta::kCurrentVersion
+                                   : Meta::kMinHasExtraPlatformInfoVersion;
+        if (p->meta.version < targetVersion) {
+            Log() << "DB version is older but compatible, updating version to v" << targetVersion << " ...";
+            p->meta.version = targetVersion;
+        }
     }
     // Set the platform info from the current process, and re-save to DB
     p->meta.makePlatformInfoCurrent();
@@ -2310,6 +2343,13 @@ void Storage::setCoin(const QString &coin) {
     }
     if (!coin.isEmpty())
         Log() << "Coin: " << coin;
+    // Update the coinbaseHeight serialization flag. This is critical when the coin
+    // is detected AFTER Storage::startup() (e.g., when meta was cleaned and the coin
+    // is first determined by Controller connecting to the node). Without this, the
+    // flag remains false and coinbaseHeight is never serialized despite being computed.
+    // Note: s_coinHasCoinbaseHeight is a reference to TXOInfo::s_coinHasCoinbaseHeight — single flag.
+    const bool isAlpha = BTC::coinFromName(coin) == BTC::Coin::ALPHA;
+    s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release);
     save(SaveItem::Meta);
 }
 
@@ -2855,6 +2895,7 @@ void Storage::loadCheckShunspentInDB()
             info.amount = shuval.amount;
             info.confirmedHeight = heightForTxNum(ctxo.txNum());
             info.tokenDataPtr = std::move(shuval.tokenDataPtr);
+            info.coinbaseHeight = shuval.coinbaseHeight;
         }
         const TxHash txHash = hashForTxNum(ctxo.txNum(), true, nullptr, true).value_or(QByteArray()); // throws if missing
         const TXO txo{txHash, ctxo.N()};
@@ -3249,7 +3290,7 @@ void Storage::setInitialSync(bool b) {
 void Storage::UTXOBatch::add(const TXO &txo, const TXOInfo &info, const CompactTXO &ctxo)
 {
     const QByteArray shukey = mkShunspentKey(info.hashX, ctxo),
-                     shuval = Serialize(info.amount, info.tokenDataPtr.get());
+                     shuval = Serialize(info.amount, info.tokenDataPtr.get(), info.coinbaseHeight);
     if (!p->cache) {
         // Update db utxoset, keyed off txo -> txoinfo
         static const QString errMsgPrefix("Failed to add a utxo to the utxo batch");
@@ -3511,6 +3552,44 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                         undo->delUndos.reserve(ppb->inputs.size());
                     }
 
+                    // Alpha vesting: build per-tx coinbaseHeight map
+                    std::vector<std::optional<BlockHeight>> txCoinbaseHeights;
+                    const bool isAlpha = BTC::coinFromName(getCoin()) == BTC::Coin::ALPHA;
+                    if (isAlpha) {
+                        txCoinbaseHeights.resize(ppb->txInfos.size());
+                        for (size_t txIdx = 0; txIdx < ppb->txInfos.size(); ++txIdx) {
+                            if (txIdx == 0) {
+                                // Coinbase tx: origin height = this block
+                                txCoinbaseHeights[txIdx] = ppb->height;
+                            } else {
+                                const auto & txInfo = ppb->txInfos[txIdx];
+                                if (!txInfo.input0Index.has_value()) {
+                                    Warning() << "Alpha vesting: tx " << txIdx << " at height " << ppb->height
+                                              << " has no input0Index, coinbaseHeight will be unknown";
+                                    continue;
+                                }
+                                const auto & firstInput = ppb->inputs[*txInfo.input0Index];
+                                if (firstInput.parentTxOutIdx.has_value()) {
+                                    // In-block spend: inherit from parent tx (already computed, txs are in order)
+                                    txCoinbaseHeights[txIdx] = txCoinbaseHeights[ppb->outputs[*firstInput.parentTxOutIdx].txIdx];
+                                } else {
+                                    // Previous block: look up spent UTXO from cache/DB
+                                    const TXO prevTxo{firstInput.prevoutHash, firstInput.prevoutN};
+                                    std::optional<TXOInfo> prevInfo;
+                                    if (p->db.utxoCache) prevInfo = p->db.utxoCache->get(prevTxo);
+                                    if (!prevInfo) prevInfo = utxoGetFromDB(prevTxo);
+                                    if (prevInfo) {
+                                        txCoinbaseHeights[txIdx] = prevInfo->coinbaseHeight;
+                                    } else {
+                                        Warning() << "Alpha vesting: could not find UTXO " << prevTxo.toString()
+                                                  << " for tx " << txIdx << " at height " << ppb->height
+                                                  << ", coinbaseHeight will be unknown";
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // add outputs
                     for (const auto & [hashX, ag] : std::as_const(ppb->hashXAggregated)) {
                         for (const auto oidx : ag.outs) {
@@ -3527,21 +3606,13 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                             info.confirmedHeight = ppb->height;
                             info.txNum = blockTxNum0 + out.txIdx;
                             info.tokenDataPtr = out.tokenDataPtr;
+                            if (isAlpha && out.txIdx < txCoinbaseHeights.size())
+                                info.coinbaseHeight = txCoinbaseHeights[out.txIdx];
                             const TXO txo{ hash, out.outN };
                             const CompactTXO ctxo(info.txNum, txo.outN);
                             utxoBatch.add(txo, info, ctxo); // add to db
                             if (undo) { // save undo info if we are in saveUndo mode
                                 undo->addUndos.emplace_back(txo, info.hashX, ctxo);
-                            }
-                            
-                            // Debug logging for the specific UTXO that's causing issues
-                            if (ppb->height >= 301000 && hash.toHex() == "f808ce16a52ce075755c3e5e20b087d65179109ef94d0df5d80bb17e6adb216b") {
-                                Debug() << "CREATING TARGET UTXO:";
-                                Debug() << "  Block height: " << ppb->height;
-                                Debug() << "  Creating txid: " << hash.toHex();
-                                Debug() << "  Output number: " << out.outN;
-                                Debug() << "  Amount: " << info.amount.ToString();
-                                Debug() << "  TxNum: " << info.txNum;
                             }
                             
                             if constexpr (debugPrt)
@@ -3598,16 +3669,6 @@ void Storage::addBlock(PreProcessedBlockPtr ppb, bool saveUndo, unsigned nReserv
                                 const auto dbgTxIdHex = ppb->txHashForInputIdx(inum).toHex();
                                 QTextStream ts(&s);
                                 ts << "Failed to spend: " << in.prevoutHash.toHex() << ":" << in.prevoutN << " (spending txid: " << dbgTxIdHex << ")";
-                                
-                                // Debug logging for blocks after 302000 to understand UTXO issues
-                                if (ppb->height >= 301500) {
-                                    Log() << "UTXO FAILURE DEBUG:";
-                                    Log() << "  Block height: " << ppb->height;
-                                    Log() << "  Spending txid: " << dbgTxIdHex;
-                                    Log() << "  Missing UTXO: " << in.prevoutHash.toHex() << ":" << in.prevoutN;
-                                    Log() << "  Input number: " << ppb->numForInputIdx(inum).value_or(0xffff);
-                                    Log() << "  Block has " << ppb->txInfos.size() << " transactions";
-                                }
                             }
                             throw InternalError(s);
                         }
@@ -4497,6 +4558,7 @@ auto Storage::listUnspent(const HashX & hashX, const TokenFilterOption tokenFilt
                                         it3->amount,  // .value
                                         TxNum(1) + veryHighTxNum + TxNum(tx->hasUnconfirmedParents() ? 1 : 0), // .txNum (this is fudged for sorting at the end properly)
                                         it3->tokenDataPtr, // .token_data
+                                        it3->coinbaseHeight, // .coinbaseHeight (Alpha vesting)
                                     });
                                 } else {
                                     // this should never happen!
@@ -4559,6 +4621,7 @@ auto Storage::listUnspent(const HashX & hashX, const TokenFilterOption tokenFilt
                         shval.amount, // .value
                         ctxo.txNum(), // .txNum
                         std::move(shval.tokenDataPtr), // .token_data
+                        shval.coinbaseHeight, // .coinbaseHeight (Alpha vesting)
                     });
                 }
             } // end confirmed/db search
@@ -4575,15 +4638,20 @@ auto Storage::listUnspent(const HashX & hashX, const TokenFilterOption tokenFilt
     return ret;
 }
 
-auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) const -> std::pair<bitcoin::Amount, bitcoin::Amount>
+auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool computeVesting) const -> BalanceResult
 {
-    std::pair<bitcoin::Amount, bitcoin::Amount> ret;
+    BalanceResult ret;
     if (hashX.length() != HashLen)
         return ret;
     auto ShouldFilter = [tokenFilter](const bitcoin::token::OutputDataPtr & p) { return ShouldTokenFilter(tokenFilter, p); };
     auto IncrementCtrAndThrowIfExceedsMaxHistory = GetMaxHistoryCtrFunc("GetBalance UTXOs",
                                                                         QString("scripthash %1").arg(QString(hashX.toHex())),
                                                                         options->maxHistory);
+    VestedBalance vb; // only used when computeVesting is true
+    bool confirmedVestingOk = false; // set to true after confirmed scan completes successfully
+    auto isVested = [](const std::optional<BlockHeight> &cbh) {
+        return cbh.has_value() && *cbh <= BTC::ALPHA_VESTING_THRESHOLD;
+    };
     try {
         // take shared lock (ensure history doesn't mutate from underneath our feet)
         SharedLockGuard g(p->blocksLock);
@@ -4600,19 +4668,31 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
                 IncrementCtrAndThrowIfExceedsMaxHistory(); // throw if we are iterating too much
                 const CompactTXO ctxo = extractCompactTXOFromShunspentKey(key); // may throw if key has the wrong size, etc
                 bool ok;
-                const auto & [valid, amount, tokenDataPtr] = Deserialize<SHUnspentValue>(FromSlice(iter->value()), &ok);
+                const auto & [valid, amount, tokenDataPtr, cbHeight] = Deserialize<SHUnspentValue>(FromSlice(iter->value()), &ok);
                 if (UNLIKELY(!ok || !valid))
                     throw InternalError(QString("Bad SHUnspentValue in db for ctxo %1 (%2)").arg(ctxo.toString(), QString(hashX.toHex())));
                 if (UNLIKELY(!bitcoin::MoneyRange(amount)))
                     throw InternalError(QString("Out-of-range amount in db for ctxo %1: %2").arg(ctxo.toString()).arg(amount / amount.satoshi()));
                 if ( ! ShouldFilter(tokenDataPtr)) {
-                    ret.first += amount; // tally the result
+                    ret.confirmed += amount; // tally the result
+                    if (computeVesting) {
+                        if (isVested(cbHeight))
+                            vb.confirmedVested += amount;
+                        else
+                            vb.confirmedUnvested += amount;
+                    }
                 }
             }
-            if (UNLIKELY(!bitcoin::MoneyRange(ret.first))) {
-                ret.first = bitcoin::Amount::zero();
+            if (UNLIKELY(!bitcoin::MoneyRange(ret.confirmed))) {
+                ret.confirmed = bitcoin::Amount::zero();
                 throw InternalError(QString("Out-of-range total in db for getBalance on scripthash: %1").arg(QString(hashX.toHex())));
             }
+            if (computeVesting && UNLIKELY(!bitcoin::MoneyRange(vb.confirmedVested) || !bitcoin::MoneyRange(vb.confirmedUnvested))) {
+                Warning() << __func__ << ": Out-of-range vested/unvested total for scripthash: " << hashX.toHex();
+                computeVesting = false; // suppress vesting breakdown entirely rather than emitting broken invariant
+            }
+            // Confirmed vesting is complete here — save it so it can survive a mempool exception.
+            confirmedVestingOk = true;
         }
         {
             // unconfirmed -- check mempool
@@ -4620,6 +4700,7 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
             if (auto it = mempool.hashXTxs.find(hashX); it != mempool.hashXTxs.end()) {
                 // for all tx's involving scripthash
                 bitcoin::Amount utxos, spends;
+                bitcoin::Amount vestedUtxos, unvestedUtxos, vestedSpends, unvestedSpends; // only used when computeVesting
                 for (const auto & tx : it->second) {
                     assert(bool(tx));
                     auto it2 = tx->hashXs.find(hashX);
@@ -4630,8 +4711,15 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
                     auto & info = it2->second;
                     IncrementCtrAndThrowIfExceedsMaxHistory(info.confirmedSpends.size() + info.utxo.size()); // throw if >maxHistory
                     for (const auto & [txo, txoinfo] : info.confirmedSpends) {
-                        if ( ! ShouldFilter(txoinfo.tokenDataPtr))
+                        if ( ! ShouldFilter(txoinfo.tokenDataPtr)) {
                             spends += txoinfo.amount;
+                            if (computeVesting) {
+                                if (isVested(txoinfo.coinbaseHeight))
+                                    vestedSpends += txoinfo.amount;
+                                else
+                                    unvestedSpends += txoinfo.amount;
+                            }
+                        }
                     }
                     for (const auto ionum : info.utxo) {
                         if (decltype(tx->txos.cbegin()) it3; UNLIKELY( ionum >= tx->txos.size()
@@ -4641,15 +4729,37 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter) cons
                                                 .arg(QString(hashX.toHex()), QString(tx->hash.toHex())).arg(ionum));
                         } else if ( ! ShouldFilter(it3->tokenDataPtr)) {
                             utxos += it3->amount;
+                            if (computeVesting) {
+                                if (isVested(it3->coinbaseHeight))
+                                    vestedUtxos += it3->amount;
+                                else
+                                    unvestedUtxos += it3->amount;
+                            }
                         }
                     }
                 }
-                ret.second = utxos - spends; // note this may not be MoneyRange (may be negative), which is ok.
+                ret.unconfirmed = utxos - spends; // note this may not be MoneyRange (may be negative), which is ok.
+                if (computeVesting) {
+                    vb.unconfirmedVested = vestedUtxos - vestedSpends;
+                    vb.unconfirmedUnvested = unvestedUtxos - unvestedSpends;
+                }
             }
         }
     } catch (const std::exception &e) {
         Warning(Log::Magenta) << __func__ << ": " << e.what();
+        if (computeVesting) {
+            if (confirmedVestingOk) {
+                // Confirmed vesting data is complete. Zero out unconfirmed vesting since we can't trust it.
+                vb.unconfirmedVested = bitcoin::Amount::zero();
+                vb.unconfirmedUnvested = bitcoin::Amount::zero();
+            } else {
+                // Confirmed vesting scan also failed — suppress vesting breakdown entirely.
+                computeVesting = false;
+            }
+        }
     }
+    if (computeVesting)
+        ret.vpiBreakdown = vb;
     return ret;
 }
 
@@ -5093,9 +5203,9 @@ namespace {
         uint32_t len = 0; ///< the length of the entire buffer, including this struct and all data to follow. A sanity check.
         uint32_t nScriptHashes = 0, nAddUndos = 0, nDelUndos = 0; ///< the number of elements in each of the 3 arrays in question.
 
-        /* ----------- V1 format (back when we had 2 byte IONums) */
+        /* ----------- V1 format (back when we had 2 byte IONums, no coinbaseHeight in TXOInfo) */
         static constexpr size_t addUndoItemSerSize_V1 = TXO::minSize() + HashLen + CompactTXO::minSize();
-        static constexpr size_t delUndoItemSerSize_V1 = TXO::minSize() + TXOInfo::minSerSize();
+        static constexpr size_t delUndoItemSerSize_V1 = TXO::minSize() + TXOInfo::legacyMinSerSize();
 
         /// computes the total size given the ser size of the blkInfo struct.
         /// Requires that nScriptHashes, nAddUndos, and nDelUndos be already filled-in.
@@ -5108,9 +5218,9 @@ namespace {
         bool isLenSane_V1() const { return size_t(len) == computeTotalSize_V1(); }
 
 
-        /* ----------- V2 format (3-byte IONums) */
+        /* ----------- V2 format (3-byte IONums, no coinbaseHeight in TXOInfo) */
         static constexpr size_t addUndoItemSerSize_V2 = TXO::maxSize() + HashLen + CompactTXO::maxSize();
-        static constexpr size_t delUndoItemSerSize_V2 = TXO::maxSize() + TXOInfo::minSerSize();
+        static constexpr size_t delUndoItemSerSize_V2 = TXO::maxSize() + TXOInfo::legacyMinSerSize();
 
         /// computes the total size given the ser size of the blkInfo struct. Requires that nScriptHashes, nAddUndos, and nDelUndos be already filled-in.
         size_t computeTotalSize_V2() const {
@@ -5121,8 +5231,9 @@ namespace {
         }
         bool isLenSane_V2() const { return size_t(len) == computeTotalSize_V2(); }
 
-        /* ----------- V3 format (same as V3 but has dynamically-sized TXOInfo objects >= 50 bytes) */
+        /* ----------- V3 format (same as V2 layout but has dynamically-sized TXOInfo objects >= 50 bytes) */
         /// computes the minimum size given the ser size of the blkInfo struct. Requires that nScriptHashes, nAddUndos, and nDelUndos be already filled-in.
+        /// Note: uses V2 total size (with legacyMinSerSize) as the lower bound, since old V3 records pre-date coinbaseHeight.
         size_t computeMinimumSize_V3() const { return computeTotalSize_V2(); }
         bool isLenMinimallySane_V3() const { return size_t(len) >= computeMinimumSize_V3(); }
     };
@@ -5280,16 +5391,19 @@ namespace {
             if (!chkAssertion(myok)) return ret;
             ret.addUndos.emplace_back(std::move(txo), std::move(hashX), std::move(ctxo));
         }
-        // 7. .delUndos, 84 (v1) or 85 (v2) bytes each * nDelUndos, for v3 the size is dynamic but always >= 85
+        // 7. .delUndos, 84 (v1) or 85 (v2) bytes each * nDelUndos, for v3 the size is dynamic but always >= 50 (legacy) or 54 (with coinbaseHeight)
         ret.delUndos.reserve(hdr.nDelUndos);
+        // Use legacyMinSerSize (50 bytes, without coinbaseHeight) as the floor for all undo versions.
+        // V1/V2 records predate coinbaseHeight; V3 records may contain either 50 or 54 byte TXOInfo.
+        constexpr size_t txoInfoMinSize = TXOInfo::legacyMinSerSize();
         for (unsigned i = 0; i < hdr.nDelUndos; ++i) {
             if (!chkAssertion(cur+TXOSerSize <= end)) return ret;
             TXO txo = Deserialize<TXO>(ShallowTmp(cur, TXOSerSize), &myok);
             cur += TXOSerSize;
-            if (!chkAssertion(myok && cur + TXOInfo::minSerSize() <= end)) return ret;
+            if (!chkAssertion(myok && cur + txoInfoMinSize <= end)) return ret;
             int txoinfo_size{};
             if (isV1 || isV2) {
-                txoinfo_size = int(TXOInfo::minSerSize());
+                txoinfo_size = int(TXOInfo::legacyMinSerSize());
             } else {
                 // V3 or above: read the byte size as a VarInt.
                 Span sp{cur, size_t(end - cur)};
@@ -5302,7 +5416,7 @@ namespace {
                     return ret;
                 }
             }
-            if (!chkAssertion(txoinfo_size >= int(TXOInfo::minSerSize()) && cur + txoinfo_size <= end,
+            if (!chkAssertion(txoinfo_size >= int(txoInfoMinSize) && cur + txoinfo_size <= end,
                               "deser of VarInt size for a TXOInfo returned an error"))
                 return ret;
             TXOInfo info = Deserialize<TXOInfo>(ShallowTmp(cur, txoinfo_size), &myok);
@@ -5361,8 +5475,16 @@ namespace {
         return ret;
     }
 
-    QByteArray Serialize(const bitcoin::Amount &a, const bitcoin::token::OutputData *ptok) {
+    QByteArray Serialize(const bitcoin::Amount &a, const bitcoin::token::OutputData *ptok, std::optional<BlockHeight> coinbaseHeight) {
         QByteArray ret = SerializeScalar(a / a.satoshi());
+        // Only write coinbaseHeight for Alpha (s_coinHasCoinbaseHeight). For BCH/BTC/LTC, the field is omitted
+        // entirely, avoiding the ambiguity of discriminating coinbaseHeight bytes from CashToken prefix (0xef).
+        if (s_coinHasCoinbaseHeight.load(std::memory_order_acquire)) {
+            const uint32_t cbh = coinbaseHeight.value_or(kNoCoinbaseHeight);
+            const auto oldSz = ret.size();
+            ret.resize(oldSz + int(sizeof(cbh)));
+            std::memcpy(ret.data() + oldSz, &cbh, sizeof(cbh));
+        }
         BTC::SerializeTokenDataWithPrefix(ret, ptok); // may be no-op if ptok is nullptr
         return ret;
     }
@@ -5373,6 +5495,29 @@ namespace {
         SHUnspentValue ret;
         if (ok) {
             ret.amount = amt * bitcoin::Amount::satoshi();
+            // Read coinbaseHeight only when the coin is Alpha (s_coinHasCoinbaseHeight). On Alpha, DB v4
+            // was created from a full resync, so ALL records have the 4-byte coinbaseHeight field. On
+            // BCH/BTC/LTC, the field was never written (Serialize skips it), so we never read it.
+            // This avoids the fundamentally broken heuristic of trying to distinguish coinbaseHeight
+            // bytes from the CashToken prefix byte (0xef) — any coinbaseHeight where height%256==239
+            // (e.g. 239, 495, 751, ..., 280303) has 0xef as its first byte in little-endian.
+            if (s_coinHasCoinbaseHeight.load(std::memory_order_acquire)) {
+                if (UNLIKELY(pos + int(sizeof(uint32_t)) > ba.size())) {
+                    // This should never happen on Alpha v4 DB — all records should have coinbaseHeight.
+                    // A truncated record indicates corruption — fail hard.
+                    Warning() << "SHUnspentValue::Deserialize: Alpha record missing coinbaseHeight field"
+                              << " (size=" << ba.size() << ", expected >=" << (pos + int(sizeof(uint32_t))) << ")";
+                    if (pok) *pok = false;
+                    ret.valid = false;
+                    return ret;
+                } else {
+                    uint32_t cbh;
+                    std::memcpy(&cbh, ba.constData() + pos, sizeof(cbh));
+                    pos += int(sizeof(cbh));
+                    if (cbh != kNoCoinbaseHeight)
+                        ret.coinbaseHeight.emplace(cbh);
+                }
+            }
             try {
                 ret.tokenDataPtr = BTC::DeserializeTokenDataWithPrefix(ba, pos);
             } catch (const std::exception &e) {

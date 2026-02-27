@@ -26,6 +26,7 @@
 #include <QString>
 
 #include <array>
+#include <atomic>
 #include <compare>
 #include <cstddef>
 #include <cstdint>
@@ -114,14 +115,23 @@ struct TXOInfo {
     std::optional<BlockHeight> confirmedHeight; ///< if unset, is mempool tx
     TxNum txNum = 0; ///< the globally mapped txNum (one for each TxHash). This is used to be able to delete the CompactTXO from the hashX's scripthash_unspent table
     bitcoin::token::OutputDataPtr tokenDataPtr; ///< may be null, if not-null, output has token data on it
+    std::optional<BlockHeight> coinbaseHeight; ///< for Alpha vesting: the block height of the originating coinbase tx
 
     bool isValid() const { return amount / bitcoin::Amount::satoshi() >= 0 && hashX.length() == HashLen; }
 
     /// for debug, etc
     bool operator==(const TXOInfo &o) const {
-        return     std::tie(  amount,   hashX,   confirmedHeight,   txNum,   tokenDataPtr)
-                == std::tie(o.amount, o.hashX, o.confirmedHeight, o.txNum, o.tokenDataPtr);
+        return     std::tie(  amount,   hashX,   confirmedHeight,   txNum,   tokenDataPtr,   coinbaseHeight)
+                == std::tie(o.amount, o.hashX, o.confirmedHeight, o.txNum, o.tokenDataPtr, o.coinbaseHeight);
     }
+
+    /// Sentinel for "no coinbase height" in serialization. Public so Storage.cpp can reference the same constant.
+    static inline constexpr BlockHeight kNoCoinbaseHeight = 0xfffffffeu;
+
+    /// Set to true by Storage::startup() when the coin is Alpha. Controls whether toBytes()/fromBytes()
+    /// include the 4-byte coinbaseHeight field. On non-Alpha chains the field is never serialized,
+    /// avoiding the ambiguity of distinguishing coinbaseHeight bytes from CashToken prefix (0xef).
+    static inline std::atomic<bool> s_coinHasCoinbaseHeight{false};
 
 private:
     static inline constexpr BlockHeight kNoBlockHeight = -1; // 0xffffffff; prevous code used int32_t(-1) to indicate no conf height
@@ -133,12 +143,13 @@ public:
         QByteArray ret;
         using QBASz = QByteArray::size_type;
         if (!isValid()) return ret;
+        const bool writeCbHeight = s_coinHasCoinbaseHeight.load(std::memory_order_acquire);
         const int64_t amt_sats = amount / bitcoin::Amount::satoshi();
         const uint32_t cheight = confirmedHeight.value_or(kNoBlockHeight); // NB: earlier version of this code used int32_t(-1) here to indicate no cheight.
-        const QBASz minSize = static_cast<QBASz>(minSerSize());
-        const QBASz rsvSize = minSize + (tokenDataPtr ? 1 + static_cast<QBASz>(tokenDataPtr->EstimatedSerialSize()) : 0);
+        const QBASz serSize = static_cast<QBASz>(writeCbHeight ? minSerSize() : legacyMinSerSize());
+        const QBASz rsvSize = serSize + (tokenDataPtr ? 1 + static_cast<QBASz>(tokenDataPtr->EstimatedSerialSize()) : 0);
         ret.reserve(rsvSize);
-        ret.resize(minSize);
+        ret.resize(serSize);
         char *cur = ret.data();
         std::memcpy(cur, &amt_sats, sizeof(amt_sats));
         cur += sizeof(amt_sats);
@@ -147,6 +158,11 @@ public:
         CompactTXO::txNumToCompactBytes(reinterpret_cast<std::byte *>(cur), txNum);
         cur += CompactTXO::compactTxNumSize(); // always 6
         std::memcpy(cur, hashX.constData(), size_t(hashX.length())); // always 32 (enforced by isValid() check above)
+        cur += HashLen;
+        if (writeCbHeight) {
+            const uint32_t cbheight = coinbaseHeight.value_or(kNoCoinbaseHeight);
+            std::memcpy(cur, &cbheight, sizeof(cbheight));
+        }
         // NOTE: `cur` may be invalidated below
         BTC::SerializeTokenDataWithPrefix(ret, tokenDataPtr.get());
         return ret;
@@ -155,7 +171,8 @@ public:
     /// `ba` must only contain the valid bytes for this object. Will not tolerate junk bytes at the end.
     static TXOInfo fromBytes(const QByteArray &ba) {
         TXOInfo ret;
-        if (size_t(ba.length()) < minSerSize()) {
+        static constexpr size_t legacyMinSerSize = sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen; // 50
+        if (size_t(ba.length()) < legacyMinSerSize) {
             return ret;
         }
         int64_t amt;
@@ -172,6 +189,17 @@ public:
         ret.amount = amt * bitcoin::Amount::satoshi();
         if (cheight != kNoBlockHeight) // NB: earlier version of this code used int32_t(-1) here to indicate no cheight.
             ret.confirmedHeight.emplace(cheight);
+        // Read coinbaseHeight (4 bytes after hashX) only when the coin is Alpha.
+        // On Alpha, DB v4 was created from a full resync so ALL utxoset and undo records include
+        // coinbaseHeight. On non-Alpha (BCH/BTC/LTC), the field is never written, so we never read it.
+        if (s_coinHasCoinbaseHeight.load(std::memory_order_acquire)
+                && size_t(ba.length()) >= size_t(cur - ba.constData()) + sizeof(uint32_t)) {
+            uint32_t cbheight;
+            std::memcpy(&cbheight, cur, sizeof(cbheight));
+            cur += sizeof(cbheight);
+            if (cbheight != kNoCoinbaseHeight)
+                ret.coinbaseHeight.emplace(cbheight);
+        }
         try {
             ret.tokenDataPtr = BTC::DeserializeTokenDataWithPrefix(ba, cur - ba.constData());
             if constexpr (false) // Left-in for debugging purposes
@@ -184,5 +212,8 @@ public:
         return ret;
     }
 
-    static constexpr size_t minSerSize() noexcept { return sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen; }
+    /// Current minimum serialized size (with coinbaseHeight): 54 bytes
+    static constexpr size_t minSerSize() noexcept { return sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen + sizeof(uint32_t); } // 54 bytes: 8 + 4 + 6 + 32 + 4
+    /// Legacy minimum serialized size (without coinbaseHeight, pre-DB v4): 50 bytes. Used for V1/V2 undo deserialization.
+    static constexpr size_t legacyMinSerSize() noexcept { return sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen; } // 50 bytes: 8 + 4 + 6 + 32
 };

@@ -139,6 +139,7 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
         auto & [tx, ctx] = pair;
         assert(hash == tx->hash);
         IONum inNum = 0;
+        std::optional<BlockHeight> cbHeightFromVin0; // Alpha vesting: capture coinbaseHeight from first input
         TxHashSet seenParents; // DSP handling, otherwise unused if no dsp
         for (const auto & in : ctx->vin) {
             const IONum prevN = IONum(in.prevout.GetN());
@@ -234,6 +235,9 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
                     Debug() << hash.toHex() << " confirmed spend: " << prevTXO.toString() << " " << refPrevInfo.amount.ToString().c_str();
                 }
             }
+            // Alpha vesting: capture coinbaseHeight from the first input (vin[0])
+            if (inNum == 0 && pprevInfo)
+                cbHeightFromVin0 = pprevInfo->coinbaseHeight;
             tx->fee += pprevInfo->amount;
             assert(sh == pprevInfo->hashX);
             this->hashXTxs[sh].push_back(tx); // mark this hashX as having been "touched" because of this input (note we push dupes here out of order but sort and uniqueify at the end)
@@ -266,10 +270,76 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
             ++inNum;
         }
 
+        // Alpha vesting: propagate coinbaseHeight from vin[0] to all outputs of this tx
+        if (cbHeightFromVin0.has_value()) {
+            for (auto & txoInfo : tx->txos)
+                if (txoInfo.isValid())
+                    txoInfo.coinbaseHeight = cbHeightFromVin0;
+        }
+
         // Now, compactify some data structures to take up less memory by rehashing thier unordered_maps/unordered_sets..
         // we do this once for each new tx we see.. and it can end up saving tons of space. Note the below structures
         // are either fixed in size or will only ever shrink as the mempool evolves so this is a good time to do this.
         tx->hashXs.rehash(tx->hashXs.size());
+    }
+
+    // Alpha vesting fixup: txsNew is an unordered_map, so a child tx may have been processed before its parent,
+    // leaving its outputs without coinbaseHeight. Re-propagate through chains until convergence.
+    {
+        bool changed = true;
+        unsigned fixupIters = 0;
+        while (changed) {
+            changed = false;
+            for (auto & [hash, pair] : txsNew) {
+                auto & [tx, ctx] = pair;
+                // Check if any valid output lacks coinbaseHeight (can't just check txos[0] — it may be OP_RETURN)
+                bool needsFixup = false;
+                for (const auto & txoInfo : tx->txos) {
+                    if (txoInfo.isValid() && !txoInfo.coinbaseHeight.has_value()) {
+                        needsFixup = true;
+                        break;
+                    }
+                }
+                if (needsFixup && !ctx->vin.empty()) {
+                    // Look up vin[0]'s parent
+                    const TxHash prevTxId = BTC::Hash2ByteArrayRev(ctx->vin[0].prevout.GetTxId());
+                    const IONum prevN = IONum(ctx->vin[0].prevout.GetN());
+                    if (auto it = this->txs.find(prevTxId); it != this->txs.end()) {
+                        auto prevTxRef = it->second;
+                        if (prevN < prevTxRef->txos.size() && prevTxRef->txos[prevN].coinbaseHeight.has_value()) {
+                            const auto cbHeight = prevTxRef->txos[prevN].coinbaseHeight;
+                            for (auto & txoInfo : tx->txos)
+                                if (txoInfo.isValid())
+                                    txoInfo.coinbaseHeight = cbHeight;
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if (++fixupIters > txsNew.size())
+                break; // safety: at most N iterations for N txs in the chain
+        }
+        if (fixupIters > 1 && TRACE)
+            Debug() << "Alpha vesting: coinbaseHeight fixup required " << fixupIters << " iteration(s)";
+
+        // Part 2: update stale coinbaseHeight in unconfirmedSpends maps.
+        // The TXOInfo copies in unconfirmedSpends were made before the parent's outputs had
+        // coinbaseHeight set (when child was processed before parent in the unordered_map).
+        // Now that tx->txos are correct, sync the spend copies from the parent's fixed outputs.
+        for (auto & [hash, pair] : txsNew) {
+            auto & [tx, ctx] = pair;
+            for (auto & [sh, ioinfo] : tx->hashXs) {
+                for (auto & [txo, spendInfo] : ioinfo.unconfirmedSpends) {
+                    if (!spendInfo.coinbaseHeight.has_value()) {
+                        if (auto it2 = this->txs.find(txo.txHash); it2 != this->txs.end()) {
+                            const auto & parentTx = it2->second;
+                            if (txo.outN < parentTx->txos.size() && parentTx->txos[txo.outN].coinbaseHeight.has_value())
+                                spendInfo.coinbaseHeight = parentTx->txos[txo.outN].coinbaseHeight;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // now, sort and uniqueify data structures made temporarily inconsistent above (have dupes, are out-of-order)
