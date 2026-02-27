@@ -247,6 +247,12 @@ namespace {
 
     static constexpr uint32_t kNoCoinbaseHeight = TXOInfo::kNoCoinbaseHeight; ///< alias for TXOInfo sentinel
 
+    /// Set to true by Storage::startup() when the coin is Alpha.
+    /// When true, SHUnspentValue records include a 4-byte coinbaseHeight field between amount and token data.
+    /// When false (BCH/BTC/LTC), the field is neither written nor read — eliminating the ambiguity of
+    /// trying to distinguish coinbaseHeight bytes from CashToken prefix bytes at deserialization time.
+    std::atomic<bool> s_coinHasCoinbaseHeight{false};
+
     // Ensures we store RPA db keys in big endian for faster scans of adjacent heights
     struct RpaDBKey {
         uint32_t height;
@@ -2042,6 +2048,16 @@ void Storage::startup()
 
     // Detect old DB version and see if upgrade is permitted, and maybe do a DB upgrade...
     checkUpgradeDBVersion();
+
+    // Set the flags that control whether serialized records include coinbaseHeight.
+    // Alpha forces a full resync to v4, so all records have the field. Non-Alpha (BCH/BTC/LTC) never writes it.
+    // This eliminates the fundamentally broken heuristic of trying to distinguish coinbaseHeight bytes from
+    // the CashToken prefix byte (0xef) — any height where height%256==239 has 0xef as its first byte.
+    {
+        const bool isAlpha = BTC::coinFromName(getCoin()) == BTC::Coin::ALPHA;
+        s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_relaxed); // anonymous namespace flag for SHUnspentValue
+        TXOInfo::s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_relaxed); // TXOInfo flag for utxoset/undo records
+    }
 
     start(); // starts our thread
 }
@@ -4708,7 +4724,9 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool
         }
     } catch (const std::exception &e) {
         Warning(Log::Magenta) << __func__ << ": " << e.what();
-        vb = VestedBalance{}; // reset vesting breakdown on error to maintain confirmed == vested + unvested invariant
+        // Suppress vesting breakdown entirely on error — returning zeros would violate the
+        // confirmed == vested + unvested invariant that clients expect.
+        computeVesting = false;
     }
     if (computeVesting)
         ret.vpiBreakdown = vb;
@@ -5429,11 +5447,14 @@ namespace {
 
     QByteArray Serialize(const bitcoin::Amount &a, const bitcoin::token::OutputData *ptok, std::optional<BlockHeight> coinbaseHeight) {
         QByteArray ret = SerializeScalar(a / a.satoshi());
-        // Append coinbaseHeight (4 bytes, sentinel if nullopt)
-        const uint32_t cbh = coinbaseHeight.value_or(kNoCoinbaseHeight);
-        const auto oldSz = ret.size();
-        ret.resize(oldSz + int(sizeof(cbh)));
-        std::memcpy(ret.data() + oldSz, &cbh, sizeof(cbh));
+        // Only write coinbaseHeight for Alpha (s_coinHasCoinbaseHeight). For BCH/BTC/LTC, the field is omitted
+        // entirely, avoiding the ambiguity of discriminating coinbaseHeight bytes from CashToken prefix (0xef).
+        if (s_coinHasCoinbaseHeight.load(std::memory_order_relaxed)) {
+            const uint32_t cbh = coinbaseHeight.value_or(kNoCoinbaseHeight);
+            const auto oldSz = ret.size();
+            ret.resize(oldSz + int(sizeof(cbh)));
+            std::memcpy(ret.data() + oldSz, &cbh, sizeof(cbh));
+        }
         BTC::SerializeTokenDataWithPrefix(ret, ptok); // may be no-op if ptok is nullptr
         return ret;
     }
@@ -5444,14 +5465,13 @@ namespace {
         SHUnspentValue ret;
         if (ok) {
             ret.amount = amt * bitcoin::Amount::satoshi();
-            // Read coinbaseHeight (4 bytes after amount) if present.
-            // Detect old-format records (pre-v4, no coinbaseHeight) by checking if the next byte is the
-            // CashToken prefix (0xef). Old records go straight from amount to token data; new records
-            // have 4 bytes of coinbaseHeight first. Records with no token data and no coinbaseHeight
-            // are exactly 8 bytes (amount only), so the size check handles that case.
-            const bool hasTokenPrefixNext = pos < ba.size()
-                                            && static_cast<uint8_t>(ba.constData()[pos]) == bitcoin::token::PREFIX_BYTE;
-            if (!hasTokenPrefixNext && pos + int(sizeof(uint32_t)) <= ba.size()) {
+            // Read coinbaseHeight only when the coin is Alpha (s_coinHasCoinbaseHeight). On Alpha, DB v4
+            // was created from a full resync, so ALL records have the 4-byte coinbaseHeight field. On
+            // BCH/BTC/LTC, the field was never written (Serialize skips it), so we never read it.
+            // This avoids the fundamentally broken heuristic of trying to distinguish coinbaseHeight
+            // bytes from the CashToken prefix byte (0xef) — any coinbaseHeight where height%256==239
+            // (e.g. 239, 495, 751, ..., 280303) has 0xef as its first byte in little-endian.
+            if (s_coinHasCoinbaseHeight.load(std::memory_order_relaxed) && pos + int(sizeof(uint32_t)) <= ba.size()) {
                 uint32_t cbh;
                 std::memcpy(&cbh, ba.constData() + pos, sizeof(cbh));
                 pos += int(sizeof(cbh));
