@@ -5154,9 +5154,9 @@ namespace {
         uint32_t len = 0; ///< the length of the entire buffer, including this struct and all data to follow. A sanity check.
         uint32_t nScriptHashes = 0, nAddUndos = 0, nDelUndos = 0; ///< the number of elements in each of the 3 arrays in question.
 
-        /* ----------- V1 format (back when we had 2 byte IONums) */
+        /* ----------- V1 format (back when we had 2 byte IONums, no coinbaseHeight in TXOInfo) */
         static constexpr size_t addUndoItemSerSize_V1 = TXO::minSize() + HashLen + CompactTXO::minSize();
-        static constexpr size_t delUndoItemSerSize_V1 = TXO::minSize() + TXOInfo::minSerSize();
+        static constexpr size_t delUndoItemSerSize_V1 = TXO::minSize() + TXOInfo::legacyMinSerSize();
 
         /// computes the total size given the ser size of the blkInfo struct.
         /// Requires that nScriptHashes, nAddUndos, and nDelUndos be already filled-in.
@@ -5169,9 +5169,9 @@ namespace {
         bool isLenSane_V1() const { return size_t(len) == computeTotalSize_V1(); }
 
 
-        /* ----------- V2 format (3-byte IONums) */
+        /* ----------- V2 format (3-byte IONums, no coinbaseHeight in TXOInfo) */
         static constexpr size_t addUndoItemSerSize_V2 = TXO::maxSize() + HashLen + CompactTXO::maxSize();
-        static constexpr size_t delUndoItemSerSize_V2 = TXO::maxSize() + TXOInfo::minSerSize();
+        static constexpr size_t delUndoItemSerSize_V2 = TXO::maxSize() + TXOInfo::legacyMinSerSize();
 
         /// computes the total size given the ser size of the blkInfo struct. Requires that nScriptHashes, nAddUndos, and nDelUndos be already filled-in.
         size_t computeTotalSize_V2() const {
@@ -5182,8 +5182,9 @@ namespace {
         }
         bool isLenSane_V2() const { return size_t(len) == computeTotalSize_V2(); }
 
-        /* ----------- V3 format (same as V3 but has dynamically-sized TXOInfo objects >= 50 bytes) */
+        /* ----------- V3 format (same as V2 layout but has dynamically-sized TXOInfo objects >= 50 bytes) */
         /// computes the minimum size given the ser size of the blkInfo struct. Requires that nScriptHashes, nAddUndos, and nDelUndos be already filled-in.
+        /// Note: uses V2 total size (with legacyMinSerSize) as the lower bound, since old V3 records pre-date coinbaseHeight.
         size_t computeMinimumSize_V3() const { return computeTotalSize_V2(); }
         bool isLenMinimallySane_V3() const { return size_t(len) >= computeMinimumSize_V3(); }
     };
@@ -5341,16 +5342,19 @@ namespace {
             if (!chkAssertion(myok)) return ret;
             ret.addUndos.emplace_back(std::move(txo), std::move(hashX), std::move(ctxo));
         }
-        // 7. .delUndos, 84 (v1) or 85 (v2) bytes each * nDelUndos, for v3 the size is dynamic but always >= 85
+        // 7. .delUndos, 84 (v1) or 85 (v2) bytes each * nDelUndos, for v3 the size is dynamic but always >= 50 (legacy) or 54 (with coinbaseHeight)
         ret.delUndos.reserve(hdr.nDelUndos);
+        // Use legacyMinSerSize (50 bytes, without coinbaseHeight) as the floor for all undo versions.
+        // V1/V2 records predate coinbaseHeight; V3 records may contain either 50 or 54 byte TXOInfo.
+        constexpr size_t txoInfoMinSize = TXOInfo::legacyMinSerSize();
         for (unsigned i = 0; i < hdr.nDelUndos; ++i) {
             if (!chkAssertion(cur+TXOSerSize <= end)) return ret;
             TXO txo = Deserialize<TXO>(ShallowTmp(cur, TXOSerSize), &myok);
             cur += TXOSerSize;
-            if (!chkAssertion(myok && cur + TXOInfo::minSerSize() <= end)) return ret;
+            if (!chkAssertion(myok && cur + txoInfoMinSize <= end)) return ret;
             int txoinfo_size{};
             if (isV1 || isV2) {
-                txoinfo_size = int(TXOInfo::minSerSize());
+                txoinfo_size = int(TXOInfo::legacyMinSerSize());
             } else {
                 // V3 or above: read the byte size as a VarInt.
                 Span sp{cur, size_t(end - cur)};
@@ -5363,7 +5367,7 @@ namespace {
                     return ret;
                 }
             }
-            if (!chkAssertion(txoinfo_size >= int(TXOInfo::minSerSize()) && cur + txoinfo_size <= end,
+            if (!chkAssertion(txoinfo_size >= int(txoInfoMinSize) && cur + txoinfo_size <= end,
                               "deser of VarInt size for a TXOInfo returned an error"))
                 return ret;
             TXOInfo info = Deserialize<TXOInfo>(ShallowTmp(cur, txoinfo_size), &myok);

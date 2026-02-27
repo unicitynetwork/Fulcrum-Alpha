@@ -199,5 +199,8 @@ public:
         return ret;
     }
 
+    /// Current minimum serialized size (with coinbaseHeight): 54 bytes
     static constexpr size_t minSerSize() noexcept { return sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen + sizeof(uint32_t); } // 54 bytes: 8 + 4 + 6 + 32 + 4
+    /// Legacy minimum serialized size (without coinbaseHeight, pre-DB v4): 50 bytes. Used for V1/V2 undo deserialization.
+    static constexpr size_t legacyMinSerSize() noexcept { return sizeof(int64_t) + sizeof(uint32_t) + CompactTXO::compactTxNumSize() + HashLen; } // 50 bytes: 8 + 4 + 6 + 32
 };

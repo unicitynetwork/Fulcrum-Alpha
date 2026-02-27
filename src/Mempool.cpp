@@ -283,6 +283,41 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
         tx->hashXs.rehash(tx->hashXs.size());
     }
 
+    // Alpha vesting fixup: txsNew is an unordered_map, so a child tx may have been processed before its parent,
+    // leaving its outputs without coinbaseHeight. Re-propagate through chains until convergence.
+    {
+        bool changed = true;
+        unsigned fixupIters = 0;
+        while (changed) {
+            changed = false;
+            for (auto & [hash, pair] : txsNew) {
+                auto & [tx, ctx] = pair;
+                // Check if this tx's outputs lack coinbaseHeight but its vin[0] parent now has it
+                if (!tx->txos.empty() && tx->txos[0].isValid() && !tx->txos[0].coinbaseHeight.has_value()) {
+                    // Look up vin[0]'s parent
+                    if (!ctx->vin.empty()) {
+                        const TxHash prevTxId = BTC::Hash2ByteArrayRev(ctx->vin[0].prevout.GetTxId());
+                        const IONum prevN = IONum(ctx->vin[0].prevout.GetN());
+                        if (auto it = this->txs.find(prevTxId); it != this->txs.end()) {
+                            auto prevTxRef = it->second;
+                            if (prevN < prevTxRef->txos.size() && prevTxRef->txos[prevN].coinbaseHeight.has_value()) {
+                                const auto cbHeight = prevTxRef->txos[prevN].coinbaseHeight;
+                                for (auto & txoInfo : tx->txos)
+                                    if (txoInfo.isValid())
+                                        txoInfo.coinbaseHeight = cbHeight;
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            if (++fixupIters > txsNew.size())
+                break; // safety: at most N iterations for N txs in the chain
+        }
+        if (fixupIters > 1 && TRACE)
+            Debug() << "Alpha vesting: coinbaseHeight fixup required " << fixupIters << " iteration(s)";
+    }
+
     // now, sort and uniqueify data structures made temporarily inconsistent above (have dupes, are out-of-order)
     for (const auto & sh : scriptHashesAffected) {
         if (auto it = this->hashXTxs.find(sh); LIKELY(it != this->hashXTxs.end()))
