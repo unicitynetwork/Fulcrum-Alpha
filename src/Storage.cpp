@@ -247,11 +247,9 @@ namespace {
 
     static constexpr uint32_t kNoCoinbaseHeight = TXOInfo::kNoCoinbaseHeight; ///< alias for TXOInfo sentinel
 
-    /// Set to true by Storage::startup() when the coin is Alpha.
-    /// When true, SHUnspentValue records include a 4-byte coinbaseHeight field between amount and token data.
-    /// When false (BCH/BTC/LTC), the field is neither written nor read — eliminating the ambiguity of
-    /// trying to distinguish coinbaseHeight bytes from CashToken prefix bytes at deserialization time.
-    std::atomic<bool> s_coinHasCoinbaseHeight{false};
+    /// Reference to the single authoritative flag in TXOInfo. Both SHUnspentValue and TXOInfo
+    /// serialization use this same flag, eliminating the risk of two flags getting out of sync.
+    auto &s_coinHasCoinbaseHeight = TXOInfo::s_coinHasCoinbaseHeight;
 
     // Ensures we store RPA db keys in big endian for faster scans of adjacent heights
     struct RpaDBKey {
@@ -2026,14 +2024,14 @@ void Storage::startup()
         }
     }
 
-    // Set the coinbaseHeight serialization flags BEFORE any deserialization occurs.
+    // Set the coinbaseHeight serialization flag BEFORE any deserialization occurs.
     // This must happen immediately after meta loading so that loadCheckUTXOsInDB() (with --checkdb)
     // and loadCheckShunspentInDB() (with -C -C) correctly handle the 4-byte coinbaseHeight field.
     // Alpha forces a full resync to v4, so all records have the field. Non-Alpha (BCH/BTC/LTC) never writes it.
+    // Note: s_coinHasCoinbaseHeight is a reference to TXOInfo::s_coinHasCoinbaseHeight — single flag for both.
     {
         const bool isAlpha = BTC::coinFromName(getCoin()) == BTC::Coin::ALPHA;
-        s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release); // anonymous namespace flag for SHUnspentValue
-        TXOInfo::s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release); // TXOInfo flag for utxoset/undo records
+        s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release);
     }
 
     // load headers -- may throw.. this must come first
@@ -2113,8 +2111,15 @@ void Storage::checkUpgradeDBVersion()
             }
         }
 
-        Log() << "DB version is older but compatible, updating version to v" << Meta::kCurrentVersion << " ...";
-        p->meta.version = Meta::kCurrentVersion;
+        // Only bump to v4 for Alpha (which needs coinbaseHeight tracking). Non-Alpha coins
+        // stay at v3 to avoid locking out rollback to upstream Fulcrum which only knows v3.
+        const auto targetVersion = (BTC::coinFromName(p->meta.coin) == BTC::Coin::ALPHA)
+                                   ? Meta::kCurrentVersion
+                                   : Meta::kMinHasExtraPlatformInfoVersion;
+        if (p->meta.version < targetVersion) {
+            Log() << "DB version is older but compatible, updating version to v" << targetVersion << " ...";
+            p->meta.version = targetVersion;
+        }
     }
     // Set the platform info from the current process, and re-save to DB
     p->meta.makePlatformInfoCurrent();
@@ -2338,13 +2343,13 @@ void Storage::setCoin(const QString &coin) {
     }
     if (!coin.isEmpty())
         Log() << "Coin: " << coin;
-    // Update the coinbaseHeight serialization flags. This is critical when the coin
+    // Update the coinbaseHeight serialization flag. This is critical when the coin
     // is detected AFTER Storage::startup() (e.g., when meta was cleaned and the coin
     // is first determined by Controller connecting to the node). Without this, the
-    // flags remain false and coinbaseHeight is never serialized despite being computed.
+    // flag remains false and coinbaseHeight is never serialized despite being computed.
+    // Note: s_coinHasCoinbaseHeight is a reference to TXOInfo::s_coinHasCoinbaseHeight — single flag.
     const bool isAlpha = BTC::coinFromName(coin) == BTC::Coin::ALPHA;
     s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release);
-    TXOInfo::s_coinHasCoinbaseHeight.store(isAlpha, std::memory_order_release);
     save(SaveItem::Meta);
 }
 
@@ -2890,6 +2895,7 @@ void Storage::loadCheckShunspentInDB()
             info.amount = shuval.amount;
             info.confirmedHeight = heightForTxNum(ctxo.txNum());
             info.tokenDataPtr = std::move(shuval.tokenDataPtr);
+            info.coinbaseHeight = shuval.coinbaseHeight;
         }
         const TxHash txHash = hashForTxNum(ctxo.txNum(), true, nullptr, true).value_or(QByteArray()); // throws if missing
         const TXO txo{txHash, ctxo.N()};
@@ -4683,8 +4689,7 @@ auto Storage::getBalance(const HashX &hashX, TokenFilterOption tokenFilter, bool
             }
             if (computeVesting && UNLIKELY(!bitcoin::MoneyRange(vb.confirmedVested) || !bitcoin::MoneyRange(vb.confirmedUnvested))) {
                 Warning() << __func__ << ": Out-of-range vested/unvested total for scripthash: " << hashX.toHex();
-                vb.confirmedVested = bitcoin::Amount::zero();
-                vb.confirmedUnvested = bitcoin::Amount::zero();
+                computeVesting = false; // suppress vesting breakdown entirely rather than emitting broken invariant
             }
             // Confirmed vesting is complete here — save it so it can survive a mempool exception.
             confirmedVestingOk = true;
@@ -5499,9 +5504,12 @@ namespace {
             if (s_coinHasCoinbaseHeight.load(std::memory_order_acquire)) {
                 if (UNLIKELY(pos + int(sizeof(uint32_t)) > ba.size())) {
                     // This should never happen on Alpha v4 DB — all records should have coinbaseHeight.
-                    // A truncated record indicates corruption.
+                    // A truncated record indicates corruption — fail hard.
                     Warning() << "SHUnspentValue::Deserialize: Alpha record missing coinbaseHeight field"
                               << " (size=" << ba.size() << ", expected >=" << (pos + int(sizeof(uint32_t))) << ")";
+                    if (pok) *pok = false;
+                    ret.valid = false;
+                    return ret;
                 } else {
                     uint32_t cbh;
                     std::memcpy(&cbh, ba.constData() + pos, sizeof(cbh));

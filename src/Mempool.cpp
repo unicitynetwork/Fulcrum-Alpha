@@ -321,6 +321,25 @@ auto Mempool::addNewTxs(ScriptHashesAffectedSet & scriptHashesAffected,
         }
         if (fixupIters > 1 && TRACE)
             Debug() << "Alpha vesting: coinbaseHeight fixup required " << fixupIters << " iteration(s)";
+
+        // Part 2: update stale coinbaseHeight in unconfirmedSpends maps.
+        // The TXOInfo copies in unconfirmedSpends were made before the parent's outputs had
+        // coinbaseHeight set (when child was processed before parent in the unordered_map).
+        // Now that tx->txos are correct, sync the spend copies from the parent's fixed outputs.
+        for (auto & [hash, pair] : txsNew) {
+            auto & [tx, ctx] = pair;
+            for (auto & [sh, ioinfo] : tx->hashXs) {
+                for (auto & [txo, spendInfo] : ioinfo.unconfirmedSpends) {
+                    if (!spendInfo.coinbaseHeight.has_value()) {
+                        if (auto it2 = this->txs.find(txo.txHash); it2 != this->txs.end()) {
+                            const auto & parentTx = it2->second;
+                            if (txo.outN < parentTx->txos.size() && parentTx->txos[txo.outN].coinbaseHeight.has_value())
+                                spendInfo.coinbaseHeight = parentTx->txos[txo.outN].coinbaseHeight;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // now, sort and uniqueify data structures made temporarily inconsistent above (have dupes, are out-of-order)
