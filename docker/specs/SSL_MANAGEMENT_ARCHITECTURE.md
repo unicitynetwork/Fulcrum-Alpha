@@ -239,11 +239,13 @@ The `ssl-setup` script determines whether HAProxy is available on the Docker net
 **Registration (HAProxy mode):**
 ```bash
 # Register HTTP routing: domain:80 -> this container:80
+# Include extra_ports if configured (e.g., Electrum TCP, WS, WSS)
 PAYLOAD=$(jq -n \
     --arg domain "$SSL_DOMAIN" \
     --arg container "$(hostname)" \
     --argjson http_port 80 \
-    '{domain: $domain, container: $container, http_port: $http_port, https_port: null}')
+    --argjson extra_ports "${EXTRA_PORTS:-null}" \
+    '{domain: $domain, container: $container, http_port: $http_port, https_port: null, extra_ports: $extra_ports}')
 
 curl -sf -X POST "http://${HAPROXY_HOST}:${HAPROXY_API_PORT}/v1/backends" \
   -H "Content-Type: application/json" \
@@ -251,7 +253,7 @@ curl -sf -X POST "http://${HAPROXY_HOST}:${HAPROXY_API_PORT}/v1/backends" \
   -d "$PAYLOAD"
 ```
 
-The `https_port: null` indicates "HTTP only for now." HTTPS passthrough is registered after the certificate is obtained (Step 3).
+The `https_port: null` indicates "HTTP only for now." HTTPS passthrough is registered after the certificate is obtained (Step 3). The `extra_ports` field (when present) registers additional port mappings with HAProxy for non-standard protocols (see Section 4.2).
 
 **Persistent HTTP server and reachability verification:**
 
@@ -414,8 +416,9 @@ if [ -n "$HAPROXY_DETECTED" ]; then
         --arg domain "$SSL_DOMAIN" \
         --arg container "$(hostname)" \
         --argjson http_port 80 \
-        --argjson https_port "${SERVICE_SSL_PORT}" \
-        '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port}')
+        --argjson https_port "${SSL_HTTPS_PORT:-${SERVICE_SSL_PORT}}" \
+        --argjson extra_ports "${EXTRA_PORTS:-null}" \
+        '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
 
     curl -sf -X POST "http://${HAPROXY_HOST}:${HAPROXY_API_PORT:-8404}/v1/backends" \
       -H "Content-Type: application/json" \
@@ -505,7 +508,12 @@ Request:
     "domain": "electrum.example.com",
     "container": "fulcrum-alpha",
     "http_port": 80,
-    "https_port": 50002
+    "https_port": 50002,
+    "extra_ports": [
+        {"listen": 50001, "target": 50001, "mode": "tcp"},
+        {"listen": 50003, "target": 50003, "mode": "http"},
+        {"listen": 50004, "target": 50004, "mode": "tcp"}
+    ]
 }
 ```
 
@@ -513,6 +521,7 @@ Request:
 - `container` (required): The container name or hostname on `haproxy-net`. This becomes the backend server address.
 - `http_port` (required): Port for HTTP routing. Set to `null` to skip HTTP backend registration.
 - `https_port` (required): Port for HTTPS/TCP passthrough. Set to `null` to skip HTTPS backend registration.
+- `extra_ports` (optional): Array of additional port mappings. Each entry has `listen` (HAProxy frontend port), `target` (backend container port), and `mode` (`"tcp"` or `"http"`). HAProxy creates a dynamic frontend for each unique listen port. HTTP mode supports WebSocket upgrade transparently.
 
 Response (201 Created):
 ```json
@@ -521,7 +530,11 @@ Response (201 Created):
     "container": "fulcrum-alpha",
     "http_port": 80,
     "https_port": 50002,
-    "map_port": null,
+    "extra_ports": [
+        {"listen": 50001, "target": 50001, "mode": "tcp"},
+        {"listen": 50003, "target": 50003, "mode": "http"},
+        {"listen": 50004, "target": 50004, "mode": "tcp"}
+    ],
     "created_at": "2026-03-30T12:00:00Z"
 }
 ```
@@ -666,7 +679,21 @@ Key changes:
 
 ### 4.2 HAProxy Routing for Fulcrum
 
-Fulcrum uses non-standard ports (50001-50004) rather than 80/443. The HAProxy integration handles this as follows:
+Fulcrum uses non-standard ports (50001-50004) rather than 80/443. With the `extra_ports` registration field, HAProxy can route all four Electrum protocols plus the HTTP management port:
+
+**Fulcrum HAProxy port mapping (full deployment):**
+
+| Frontend Port | Mode | Routing | Backend Port | Protocol |
+|---|---|---|---|---|
+| 80 | HTTP | Host header | 80 | Certbot ACME + ssl-manager proxy |
+| 443 | TCP | SNI | 50002 | Electrum SSL |
+| 50001 | TCP | default_backend | 50001 | Electrum TCP (raw, no TLS) |
+| 50003 | HTTP | Host header | 50003 | Electrum WebSocket |
+| 50004 | TCP | SNI | 50004 | Electrum WebSocket Secure |
+
+Note: HAProxy in HTTP mode transparently supports WebSocket upgrade.
+Port 50003 handles both initial HTTP handshake and subsequent WebSocket frames.
+Port 50004 uses TCP passthrough -- TLS termination and WebSocket upgrade happen at Fulcrum.
 
 **HTTP (port 80) -- ssl-manager HTTP reverse proxy:**
 - HAProxy routes `domain:80` to `fulcrum-alpha:80` (HTTP mode).
@@ -680,8 +707,36 @@ Fulcrum uses non-standard ports (50001-50004) rather than 80/443. The HAProxy in
 - TLS termination happens inside the Fulcrum container. HAProxy never sees the plaintext.
 - Electrum clients connect to `domain:443` and get routed to Fulcrum's SSL port transparently.
 
+**TCP (port 50001) -- Electrum TCP:**
+- HAProxy creates a TCP frontend on port 50001 and routes to `fulcrum-alpha:50001`.
+- No TLS, no host header inspection. Traffic is forwarded as raw TCP.
+
+**WS (port 50003) -- Electrum WebSocket:**
+- HAProxy creates an HTTP-mode frontend on port 50003 and routes to `fulcrum-alpha:50003`.
+- HTTP mode transparently handles the WebSocket upgrade (`Connection: Upgrade`, `Upgrade: websocket` headers are forwarded to the backend).
+- After upgrade, HAProxy maintains the bidirectional WebSocket connection.
+
+**WSS (port 50004) -- Electrum WebSocket Secure:**
+- HAProxy creates a TCP frontend on port 50004 and routes to `fulcrum-alpha:50004` via TLS passthrough.
+- The entire TLS connection, including the WebSocket upgrade inside it, is forwarded to Fulcrum.
+- Fulcrum handles both TLS termination and WebSocket processing.
+
 **Why not the standard 443 inside the container:**
 Fulcrum listens on 50002 for SSL, and changing this would break existing configurations and client expectations. HAProxy's TCP passthrough maps external 443 to internal 50002 seamlessly.
+
+### WebSocket Proxying
+
+HAProxy natively supports WebSocket when operating in HTTP mode. The `Connection: Upgrade`
+and `Upgrade: websocket` headers are forwarded transparently to the backend. No special
+HAProxy configuration is needed.
+
+For **WS** (port 50003): HAProxy creates an HTTP-mode frontend that handles the initial
+HTTP request and the WebSocket upgrade. After upgrade, HAProxy maintains the bidirectional
+connection.
+
+For **WSS** (port 50004): HAProxy operates in TCP mode (TLS passthrough). The entire
+TLS connection, including the WebSocket upgrade inside it, is forwarded to Fulcrum.
+Fulcrum handles both TLS termination and WebSocket processing.
 
 ### 4.3 Fulcrum-Specific Port Mapping Through HAProxy
 
@@ -852,6 +907,8 @@ certbot renew --webroot --webroot-path /var/www/acme-challenge
 | `APP_HTTP_PORT` | No | `0` | Internal port where the application's HTTP server listens. The ssl-manager proxy on port 80 forwards non-management traffic here. Set to 0 to disable proxying (proxy returns 404 for non-ssl paths). **Validation**: Must not be 80 (circular proxy), 8404 (HAProxy API), or any port used by ssl-manager internals. Valid range: 0 (disabled) or 1024-65535. |
 | `SSL_TEST_MODE` | No | `false` | **Development/CI only.** When `true`, generates a self-signed certificate instead of calling certbot. Useful for testing the SSL setup flow without needing a publicly reachable domain or Let's Encrypt access. Do not use in production. |
 | `HAPROXY_API_KEY` | No | (unset) | Shared secret for HAProxy Registration API authentication. When set, all API requests include an `Authorization: Bearer <key>` header. Strongly recommended for environments where multiple teams or untrusted containers share the Docker network. |
+| `EXTRA_PORTS` | No | (empty) | JSON array of extra port mappings for HAProxy registration. Format: `[{"listen":50001,"target":50001,"mode":"tcp"},...]`. When empty/null, only http_port and https_port are registered. Each entry creates a dynamic HAProxy frontend on the specified listen port. |
+| `SSL_HTTPS_PORT` | No | `443` | Backend port HAProxy routes HTTPS/TLS traffic to. For Fulcrum, set to 50002 (Electrum SSL port). Overrides `SSL_SERVICE_PORT` when both are set. |
 | `RPC_HOST` | Yes | `alpha-node` | Alpha node RPC hostname (existing variable, unchanged). |
 | `RPC_PORT` | Yes | `8589` | Alpha node RPC port (existing variable, unchanged). |
 | `RPC_USER` | Yes | `user` | Alpha node RPC username (existing variable, unchanged). |
@@ -971,7 +1028,7 @@ graph TB
 
     subgraph Host["Docker Host"]
         subgraph haproxy-net["haproxy-net (Docker bridge network)"]
-            HAProxy["HAProxy<br/>:80 HTTP routing<br/>:443 TCP/SNI passthrough<br/>:8404 Registration API (internal)"]
+            HAProxy["HAProxy<br/>:80 HTTP routing<br/>:443 TCP/SNI passthrough<br/>:50001 TCP (extra_ports)<br/>:50003 HTTP/WS (extra_ports)<br/>:50004 TCP/WSS (extra_ports)<br/>:8404 Registration API (internal)"]
             Fulcrum_hp["fulcrum-alpha<br/>(haproxy-net interface)"]
             Other["other-service<br/>(haproxy-net interface)"]
         end
@@ -983,9 +1040,15 @@ graph TB
     end
 
     Client -->|"50002 or 443"| HAProxy
+    Client -->|"50001 TCP"| HAProxy
+    Client -->|"50003 WS"| HAProxy
+    Client -->|"50004 WSS"| HAProxy
     LE -->|"HTTP-01 :80"| HAProxy
     HAProxy -->|"Host: domain :80"| Fulcrum_hp
     HAProxy -->|"SNI: domain :443 -> :50002"| Fulcrum_hp
+    HAProxy -->|"TCP :50001 -> :50001"| Fulcrum_hp
+    HAProxy -->|"HTTP/WS :50003 -> :50003"| Fulcrum_hp
+    HAProxy -->|"TCP/WSS :50004 -> :50004"| Fulcrum_hp
     Fulcrum_hp -.- Fulcrum_an
     Fulcrum_an -->|"JSON-RPC :8589"| AlphaNode
 
@@ -1005,8 +1068,13 @@ Note: `fulcrum-alpha` is a single container connected to both networks. The two 
 |---|---|---|---|
 | 80 | 80 | HTTP | Domain routing, ACME challenges |
 | 443 | 443 | TCP | SNI-based TLS passthrough |
+| 50001 | 50001 | TCP | Electrum TCP (via extra_ports) |
+| 50003 | 50003 | HTTP | Electrum WebSocket (via extra_ports) |
+| 50004 | 50004 | TCP | Electrum WSS (via extra_ports) |
 | 8000 | 8000 | HTTP | Map download (existing) |
 | (none) | 8404 | HTTP | Registration API (internal only) |
+
+Note: Ports 50001, 50003, and 50004 are dynamically created by HAProxy when a backend registers with `extra_ports`. They are only active when a Fulcrum service is registered.
 
 **Fulcrum container (with HAProxy -- no ports published to host):**
 
@@ -1052,6 +1120,31 @@ Internet → HAProxy:80 → container:80 (ssl-http-proxy)
                                       ├── /.well-known/acme-challenge/* → webroot files
                                       ├── /_ssl/* → ssl-manager handlers
                                       └── /* → localhost:APP_HTTP_PORT (app)
+```
+
+**Electrum TCP client connection (through HAProxy, via extra_ports):**
+```
+Client -> host:50001 -> HAProxy:50001 (TCP mode, default_backend)
+  -> route to backend "fulcrum-alpha:50001" on haproxy-net
+  -> Raw Electrum protocol (no TLS)
+```
+
+**Electrum WebSocket connection (through HAProxy, via extra_ports):**
+```
+Client -> host:50003 -> HAProxy:50003 (HTTP mode)
+  -> Host header matches "electrum.example.com"
+  -> route to backend "fulcrum-alpha:50003" on haproxy-net
+  -> HTTP upgrade to WebSocket (Connection: Upgrade, Upgrade: websocket)
+  -> Bidirectional WebSocket frames forwarded transparently
+```
+
+**Electrum WSS connection (through HAProxy, via extra_ports):**
+```
+Client -> host:50004 -> HAProxy:50004 (TCP mode, SNI passthrough)
+  -> SNI matches "electrum.example.com"
+  -> route to backend "fulcrum-alpha:50004" on haproxy-net
+  -> TLS handshake with Fulcrum (passthrough)
+  -> WebSocket upgrade inside TLS tunnel (handled by Fulcrum)
 ```
 
 **Fulcrum to Alpha node RPC:**
@@ -1316,6 +1409,8 @@ docker/
 - `SSL_SERVICE_PORT` -- optional (default: 443)
 - `SSL_SKIP_VERIFY` -- optional (default: false)
 - `SSL_STAGING` -- optional (default: false)
+- `SSL_HTTPS_PORT` -- optional (default: 443, set to 50002 for Fulcrum)
+- `EXTRA_PORTS` -- optional (JSON array of extra port mappings for HAProxy)
 - `APP_HTTP_PORT` -- optional (default: 8080, set to 0 to disable app forwarding)
 
 **Outputs (environment variables, exported on success):**

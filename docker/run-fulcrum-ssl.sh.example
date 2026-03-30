@@ -75,6 +75,20 @@ SSL_TEST_MODE="${SSL_TEST_MODE:-}"
 #   Override for services that need HTTP on port 80 (e.g., web apps).
 APP_HTTP_PORT="${APP_HTTP_PORT:-0}"
 
+# ── HAProxy extra port mappings ──────────────────────────────────────────────
+# EXTRA_PORTS: JSON array of additional port mappings for HAProxy.
+#   Each entry: {"listen":<port>,"target":<port>,"mode":"http"|"tcp"}
+#   For Fulcrum, this registers Electrum protocol ports with HAProxy:
+#   - TCP (50001): raw Electrum protocol
+#   - WS  (50003): Electrum over WebSocket (HTTP mode, upgrade supported)
+#   - WSS (50004): Electrum over WebSocket Secure (TCP passthrough)
+EXTRA_PORTS="${EXTRA_PORTS:-}"
+
+# SSL_HTTPS_PORT: backend port for HTTPS/TLS traffic via HAProxy.
+#   HAProxy routes domain:443 → container:SSL_HTTPS_PORT via TCP passthrough.
+#   For Fulcrum, this is 50002 (Electrum SSL), not 443.
+SSL_HTTPS_PORT="${SSL_HTTPS_PORT:-50002}"
+
 # ── HAProxy settings ─────────────────────────────────────────────────────────
 # HAPROXY_HOST: hostname of the HAProxy container on the Docker network.
 #   Set to empty or use --no-haproxy to skip HAProxy integration.
@@ -125,6 +139,8 @@ while [[ $# -gt 0 ]]; do
         --no-ssl)         SSL_DOMAIN="";          shift ;;
 
         --app-http-port)  require_arg "$1" "${2:-}"; APP_HTTP_PORT="$2"; shift 2 ;;
+        --extra-ports)    require_arg "$1" "${2:-}"; EXTRA_PORTS="$2"; shift 2 ;;
+        --ssl-https-port) require_arg "$1" "${2:-}"; SSL_HTTPS_PORT="$2"; shift 2 ;;
 
         --haproxy-host)   require_arg "$1" "${2:-}"; HAPROXY_HOST="$2";      shift 2 ;;
         --haproxy-net)    require_arg "$1" "${2:-}"; HAPROXY_NET="$2";       shift 2 ;;
@@ -171,6 +187,8 @@ SSL Configuration:
 
 Application:
   --app-http-port <port>   App HTTP port behind ssl-manager proxy (default: 0/disabled)
+  --extra-ports <json>     Extra HAProxy port mappings (JSON array)
+  --ssl-https-port <port>  Backend port for HTTPS via HAProxy (default: 50002)
 
 HAProxy Configuration:
   --haproxy-host <host>    HAProxy hostname (default: haproxy)
@@ -231,6 +249,7 @@ validate_port "PORT_TCP" "$PORT_TCP"
 validate_port "PORT_SSL" "$PORT_SSL"
 validate_port "PORT_WS" "$PORT_WS"
 validate_port "PORT_WSS" "$PORT_WSS"
+validate_port "SSL_HTTPS_PORT" "$SSL_HTTPS_PORT"
 
 if [ "$APP_HTTP_PORT" = "80" ]; then
     echo "ERROR: APP_HTTP_PORT cannot be 80 — port 80 is reserved for the ssl-manager proxy" >&2
@@ -308,7 +327,15 @@ fi
 if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
     ENV_ARGS+=( -e "HAPROXY_HOST=$HAPROXY_HOST" )
     ENV_ARGS+=( -e "HAPROXY_API_PORT=$HAPROXY_API_PORT" )
+    ENV_ARGS+=( -e "SSL_HTTPS_PORT=$SSL_HTTPS_PORT" )
     [ -n "$HAPROXY_API_KEY" ] && ENV_ARGS+=( -e "HAPROXY_API_KEY=$HAPROXY_API_KEY" )
+    [ -n "$EXTRA_PORTS" ] && ENV_ARGS+=( -e "EXTRA_PORTS=$EXTRA_PORTS" )
+fi
+
+# Default extra ports for Fulcrum when using HAProxy
+if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ] && [ -z "$EXTRA_PORTS" ]; then
+    EXTRA_PORTS='[{"listen":50001,"target":50001,"mode":"tcp"},{"listen":50003,"target":50003,"mode":"http"},{"listen":50004,"target":50004,"mode":"tcp"}]'
+    ENV_ARGS+=( -e "EXTRA_PORTS=$EXTRA_PORTS" )
 fi
 
 ###############################################################################
@@ -324,13 +351,9 @@ fi
 
 PORT_ARGS=()
 if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
-    # Behind HAProxy: SSL (50002) is routed through HAProxy via domain:443 TCP
-    # passthrough. Publish TCP, WS, and WSS for direct client access. WSS must
-    # be published directly because HAProxy's 443 passthrough goes to the SSL
-    # port (50002), not the WSS port (50004).
+    # Behind HAProxy: Electrum SSL/WS/WSS traffic routed through HAProxy.
+    # Only publish TCP for direct access (optional).
     PORT_ARGS+=( -p "${PORT_TCP}:50001" )
-    PORT_ARGS+=( -p "${PORT_WS}:50003" )
-    PORT_ARGS+=( -p "${PORT_WSS}:50004" )
 else
     # Direct mode: publish all ports
     PORT_ARGS+=(
@@ -423,14 +446,16 @@ echo "Endpoints:"
 echo "  Electrum TCP:  localhost:$PORT_TCP"
 if [ -n "$SSL_DOMAIN" ]; then
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
-        echo "  Electrum SSL:  $SSL_DOMAIN:443 (via HAProxy)"
+        echo "  Electrum SSL:  $SSL_DOMAIN:443 (via HAProxy -> :$SSL_HTTPS_PORT)"
+        echo "  Electrum WS:   $SSL_DOMAIN:50003 (via HAProxy)"
+        echo "  Electrum WSS:  $SSL_DOMAIN:50004 (via HAProxy)"
     else
         echo "  Electrum SSL:  localhost:$PORT_SSL"
+        echo "  WebSocket:     localhost:$PORT_WS"
+        echo "  WSS:           localhost:$PORT_WSS"
     fi
-fi
-echo "  WebSocket:     localhost:$PORT_WS"
-if [ -n "$SSL_DOMAIN" ]; then
-    echo "  WSS:           localhost:$PORT_WSS"
+else
+    echo "  WebSocket:     localhost:$PORT_WS"
 fi
 echo ""
 echo "Commands:"
