@@ -28,6 +28,16 @@ require_arg() {
     fi
 }
 
+# Helper: validate a port number
+validate_port() {
+    local name="$1" value="$2"
+    if [ "$value" = "0" ]; then return 0; fi  # 0 means "disabled" for APP_HTTP_PORT
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+        printf 'ERROR: %s must be a port number (1-65535), got: %s\n' "$name" "$value" >&2
+        exit 1
+    fi
+}
+
 ###############################################################################
 # Configuration — edit these or override via environment
 ###############################################################################
@@ -60,8 +70,10 @@ SSL_TEST_MODE="${SSL_TEST_MODE:-}"
 # ── Application HTTP port ────────────────────────────────────────────────────
 # APP_HTTP_PORT: internal port where the application serves HTTP behind the
 #   ssl-manager reverse proxy on port 80. The proxy forwards non-ssl traffic
-#   here. For Fulcrum, this is unused (Fulcrum serves Electrum protocol, not HTTP).
-APP_HTTP_PORT="${APP_HTTP_PORT:-8080}"
+#   here. Set to 0 to disable app forwarding (proxy returns 404 for non-ssl paths).
+#   Fulcrum does not serve HTTP, so this defaults to 0 (disabled).
+#   Override for services that need HTTP on port 80 (e.g., web apps).
+APP_HTTP_PORT="${APP_HTTP_PORT:-0}"
 
 # ── HAProxy settings ─────────────────────────────────────────────────────────
 # HAPROXY_HOST: hostname of the HAProxy container on the Docker network.
@@ -158,7 +170,7 @@ SSL Configuration:
   --no-ssl                 Run without SSL (TCP + WS only)
 
 Application:
-  --app-http-port <port>   App HTTP port behind ssl-manager proxy (default: 8080)
+  --app-http-port <port>   App HTTP port behind ssl-manager proxy (default: 0/disabled)
 
 HAProxy Configuration:
   --haproxy-host <host>    HAProxy hostname (default: haproxy)
@@ -210,6 +222,18 @@ fi
 
 if [ -n "$SSL_DOMAIN" ] && ! printf '%s' "$SSL_DOMAIN" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9.-]*[a-zA-Z0-9])?$'; then
     printf 'ERROR: Invalid domain format: '\''%s'\''\n' "$SSL_DOMAIN" >&2
+    exit 1
+fi
+
+validate_port "APP_HTTP_PORT" "$APP_HTTP_PORT"
+validate_port "RPC_PORT" "$RPC_PORT"
+validate_port "PORT_TCP" "$PORT_TCP"
+validate_port "PORT_SSL" "$PORT_SSL"
+validate_port "PORT_WS" "$PORT_WS"
+validate_port "PORT_WSS" "$PORT_WSS"
+
+if [ "$APP_HTTP_PORT" = "80" ]; then
+    echo "ERROR: APP_HTTP_PORT cannot be 80 — port 80 is reserved for the ssl-manager proxy" >&2
     exit 1
 fi
 
@@ -300,11 +324,13 @@ fi
 
 PORT_ARGS=()
 if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
-    # Behind HAProxy: no host port publishing needed.
-    # HAProxy routes domain:443 → container:50002 via TCP passthrough.
-    # Optionally publish Electrum TCP for direct access:
+    # Behind HAProxy: SSL (50002) is routed through HAProxy via domain:443 TCP
+    # passthrough. Publish TCP, WS, and WSS for direct client access. WSS must
+    # be published directly because HAProxy's 443 passthrough goes to the SSL
+    # port (50002), not the WSS port (50004).
     PORT_ARGS+=( -p "${PORT_TCP}:50001" )
     PORT_ARGS+=( -p "${PORT_WS}:50003" )
+    PORT_ARGS+=( -p "${PORT_WSS}:50004" )
 else
     # Direct mode: publish all ports
     PORT_ARGS+=(
@@ -356,7 +382,7 @@ if [ -n "$SSL_DOMAIN" ] && [ "$RPC_PASS" = "password" ]; then
 fi
 echo ""
 
-docker run -d \
+if ! docker run -d \
     --restart on-failure:5 \
     --name "$CONTAINER_NAME" \
     --network "$ALPHA_NET" \
@@ -365,17 +391,24 @@ docker run -d \
     -v "${LETSENCRYPT_VOLUME}:/etc/letsencrypt" \
     "${PORT_ARGS[@]}" \
     "${ENV_ARGS[@]}" \
-    "$IMAGE_NAME"
+    "$IMAGE_NAME"; then
+    echo "ERROR: Failed to start container. Check port conflicts and docker logs." >&2
+    exit 1
+fi
 
 # If HAProxy mode, connect the container to the HAProxy network as well
 if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
     echo "Connecting to HAProxy network '$HAPROXY_NET'..."
-    if ! docker network connect "$HAPROXY_NET" "$CONTAINER_NAME" 2>&1; then
-        echo "ERROR: Failed to connect container to HAProxy network '$HAPROXY_NET'" >&2
-        echo "Stopping container..."
-        docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
-        docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
-        exit 1
+    if ! docker network connect "$HAPROXY_NET" "$CONTAINER_NAME" 2>/dev/null; then
+        # Check if already connected (not an error)
+        if docker inspect "$CONTAINER_NAME" --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' 2>/dev/null | grep -q "$HAPROXY_NET"; then
+            echo "Container already connected to '$HAPROXY_NET'"
+        else
+            echo "ERROR: Failed to connect container to HAProxy network '$HAPROXY_NET'" >&2
+            docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+            docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
+            exit 1
+        fi
     fi
 fi
 
@@ -397,11 +430,7 @@ if [ -n "$SSL_DOMAIN" ]; then
 fi
 echo "  WebSocket:     localhost:$PORT_WS"
 if [ -n "$SSL_DOMAIN" ]; then
-    if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
-        echo "  WSS:           $SSL_DOMAIN:443 (via HAProxy)"
-    else
-        echo "  WSS:           localhost:$PORT_WSS"
-    fi
+    echo "  WSS:           localhost:$PORT_WSS"
 fi
 echo ""
 echo "Commands:"

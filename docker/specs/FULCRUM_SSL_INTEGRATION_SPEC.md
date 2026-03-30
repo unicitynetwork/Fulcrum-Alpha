@@ -254,6 +254,7 @@ sequenceDiagram
 
     alt SSL_DOMAIN is set
         EP->>SSL: Execute ssl-setup
+        SSL->>SSL: Start HTTP reverse proxy on port 80
         SSL->>SSL: Check existing cert in /etc/letsencrypt/
 
         alt Valid cert exists and not expiring
@@ -262,10 +263,11 @@ sequenceDiagram
             alt HAProxy detected
                 SSL->>HA: POST /v1/backends (domain, container, ports)
                 HA-->>SSL: 200 OK (routing configured)
-                SSL->>CB: certbot certonly --webroot (challenge via HAProxy)
             else No HAProxy
-                SSL->>CB: certbot certonly --webroot --webroot-path /var/www/acme-challenge
+                Note right of SSL: Port 80 proxy already running
             end
+            SSL->>SSL: Verify domain reachability (nonce check via proxy)
+            SSL->>CB: certbot certonly --webroot --webroot-path /var/www/acme-challenge
             CB-->>SSL: Cert acquired (or error)
 
             alt Cert acquisition failed
@@ -277,7 +279,6 @@ sequenceDiagram
                 end
             else Cert acquired
                 SSL->>SSL: Verify HTTPS reachability
-                SSL->>SSL: Start HTTP reverse proxy on port 80
                 SSL->>SSL: Start renewal background loop
                 SSL-->>EP: Exit 0 (cert ready)
             end
@@ -479,6 +480,10 @@ Internet --> HAProxy:80  --> fulcrum:80   (HTTP reverse proxy: ACME challenges +
 Internet --> HAProxy:443 --> fulcrum:50002 (SSL Electrum, TCP passthrough via SNI)
 ```
 
+In HAProxy mode, WSS (port 50004) is published directly on the host because
+HAProxy's TCP passthrough on port 443 routes only to Fulcrum's SSL port (50002).
+WSS clients connect to the published WSS port directly, not through HAProxy.
+
 HAProxy routing rules for Fulcrum (added to haproxy.cfg):
 
 ```
@@ -531,7 +536,12 @@ Port 80 inside the container is managed entirely by the ssl-manager base image's
 | `SSL_STAGING` | No | `false` | Use Let's Encrypt staging environment. Set to `true` during development/testing. |
 | `SSL_REQUIRED` | No | `true` (when `SSL_DOMAIN` set) | When `true` (default): ssl-setup failure exits the container with exit code 10-14. When `false`: ssl-setup failure logs WARNING and falls back to TCP-only. |
 | `SSL_TEST_MODE` | No | `false` | Development/CI-only. When `true`, generates a self-signed certificate instead of running certbot. Do not use in production. |
-| `APP_HTTP_PORT` | No | `8080` | Port for the application HTTP server behind the ssl-manager proxy. Fulcrum does not serve HTTP, so this is unused — the proxy returns 502 for non-ssl paths, which is expected. |
+| `APP_HTTP_PORT` | No | `0` | Port for the application HTTP server behind the ssl-manager proxy. Fulcrum does not serve HTTP, so this defaults to 0 (disabled -- proxy returns 404 for non-ssl paths). Do not set to 8080, which collides with Fulcrum's stats port. |
+
+> **Warning:** Do not set APP_HTTP_PORT to the same value as Fulcrum's stats port
+> (default 8080) or admin port (default 8000). This would expose internal admin
+> interfaces to the public internet through the ssl-manager proxy on port 80.
+> For Fulcrum, APP_HTTP_PORT should remain at 0 (disabled).
 
 ### Existing Fulcrum Variables (Unchanged)
 
@@ -727,7 +737,7 @@ fi
 
 ### Port 80 During Renewal
 
-The ssl-manager base image runs an HTTP reverse proxy on port 80. The proxy intercepts `/.well-known/acme-challenge/` for certbot and `/_ssl/*` for management endpoints (health, nonce verification), forwarding all other traffic to `localhost:$APP_HTTP_PORT` (default 8080). For Fulcrum, no application HTTP server runs, so non-ssl paths return 502 (expected behavior).
+The ssl-manager base image runs an HTTP reverse proxy on port 80. The proxy intercepts `/.well-known/acme-challenge/` for certbot and `/_ssl/*` for management endpoints (health, nonce verification), forwarding all other traffic to `localhost:$APP_HTTP_PORT` (default 0, disabled). For Fulcrum, APP_HTTP_PORT is 0, so non-ssl paths return 404 (expected behavior).
 
 - `/.well-known/acme-challenge/*` requests are served from the certbot webroot (for HTTP-01 validation).
 - `/_ssl/health` returns certificate expiry status as JSON.
@@ -901,7 +911,7 @@ docker network connect "$HAPROXY_NET" "$CONTAINER_NAME"
 
 ### HTTP Reverse Proxy Architecture
 
-Services that need port 80 for their own HTTP traffic (e.g., web applications) can bind to `APP_HTTP_PORT` (default 8080) instead of port 80. The ssl-manager proxy transparently forwards all non-ssl traffic to them. The application has no awareness of certbot, ACME challenges, or ssl-manager internals.
+Services that need port 80 for their own HTTP traffic (e.g., web applications) can bind to `APP_HTTP_PORT` (default 0, disabled) instead of port 80. The ssl-manager proxy transparently forwards all non-ssl traffic to them. The application has no awareness of certbot, ACME challenges, or ssl-manager internals.
 
 For Fulcrum specifically, no application HTTP server runs on `APP_HTTP_PORT` because Fulcrum serves the Electrum protocol, not HTTP. The proxy returns 502 for non-ssl paths, which is expected and harmless since no legitimate client sends HTTP requests to an Electrum server.
 
@@ -1047,6 +1057,9 @@ The Fulcrum integration depends on the following interface provided by `ssl-mana
 |------|---------|
 | `/usr/local/bin/ssl-setup` | One-shot SSL setup: HAProxy registration, certbot, verification. Reads `SSL_DOMAIN`, `SSL_ADMIN_EMAIL`, `HAPROXY_HOST`, `HAPROXY_API_PORT`, `SSL_CERT_RENEW_DAYS`, `SSL_STAGING` from environment. Exit 0 on success or if no `SSL_DOMAIN` set. Non-zero on failure. |
 | `/usr/local/bin/ssl-renew` | Certificate renewal: runs `certbot renew`, triggers deploy hooks on success. Called by the background renewal loop. |
+| `/usr/local/bin/haproxy-register` | HAProxy Registration API client: registers/deregisters domain backends with HAProxy via its REST API on port 8404. |
+| `/usr/local/bin/ssl-verify` | Domain reachability and TLS verification: posts a nonce via the HTTP proxy and verifies it is reachable through the public domain. Also verifies TLS handshake after cert acquisition. |
+| `/usr/local/bin/ssl-http-proxy` | HTTP reverse proxy (Python): runs on port 80, routes ACME challenges, `/_ssl/*` management endpoints, and forwards remaining traffic to `localhost:$APP_HTTP_PORT`. |
 
 ### Directory Structure
 

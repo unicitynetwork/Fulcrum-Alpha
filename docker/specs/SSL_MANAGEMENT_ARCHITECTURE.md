@@ -49,7 +49,7 @@ A generic Debian-based image containing all SSL management tooling and an HTTP r
 **Contents:**
 - certbot (via `apt`)
 - curl, jq, openssl, netcat-openbsd (utilities)
-- `APP_HTTP_PORT` environment variable (default: 8080) for reverse proxy upstream configuration
+- `APP_HTTP_PORT` environment variable (default: 0) for reverse proxy upstream configuration
 - `/usr/local/bin/ssl-setup` -- main SSL orchestration script
 - `/usr/local/bin/ssl-renew` -- certificate renewal script
 - `/usr/local/bin/haproxy-register` -- HAProxy registration client
@@ -260,9 +260,9 @@ A persistent HTTP reverse proxy runs on port 80 for the lifetime of the containe
 1. **ACME challenges**: Serves certbot HTTP-01 challenge files from `/.well-known/acme-challenge/` (webroot mode).
 2. **Nonce verification**: Provides `/_ssl/nonce/{nonce}` endpoints for domain reachability testing during setup.
 3. **SSL health**: Exposes `/_ssl/health` with certificate status (expiry date, days remaining, renewal status).
-4. **Application proxying**: Forwards all other HTTP traffic transparently to the application server at `localhost:$APP_HTTP_PORT` (default: 8080).
+4. **Application proxying**: Forwards all other HTTP traffic transparently to the application server at `localhost:$APP_HTTP_PORT` (default: 0, disabled).
 
-The application's HTTP server (if any) binds to `APP_HTTP_PORT` (default 8080) and has zero awareness of ssl-manager. It receives proxied requests with original headers, methods, and bodies intact. If no application is listening on `APP_HTTP_PORT`, the proxy returns 502 Bad Gateway for non-ssl-manager paths -- this is expected during SSL setup before the main service starts.
+The application's HTTP server (if any) binds to `APP_HTTP_PORT` (default 0, disabled) and has zero awareness of ssl-manager. It receives proxied requests with original headers, methods, and bodies intact. If no application is listening on `APP_HTTP_PORT`, the proxy returns 502 Bad Gateway for non-ssl-manager paths -- this is expected during SSL setup before the main service starts.
 
 This design allows the application to use port 80 for its own HTTP traffic while ssl-manager transparently handles certificate operations on the same port. The application never needs to serve `/.well-known/acme-challenge/` or any other ssl-manager path.
 
@@ -276,7 +276,7 @@ mkdir -p "$WEBROOT/.well-known/acme-challenge"
 #   /_ssl/health                  → ssl-manager status JSON
 #   /_ssl/nonce/*                 → nonce verification (setup only)
 #   /*                            → reverse proxy to localhost:$APP_HTTP_PORT
-APP_HTTP_PORT="${APP_HTTP_PORT:-8080}"
+APP_HTTP_PORT="${APP_HTTP_PORT:-0}"
 
 python3 /usr/local/bin/ssl-http-proxy \
     --port 80 \
@@ -331,7 +331,7 @@ The nonce verification is essential. It confirms end-to-end reachability: the In
     "cert_expires": "2026-06-28T12:00:00Z",
     "days_remaining": 89,
     "last_renewal_check": "2026-03-30T03:42:00Z",
-    "app_upstream": "127.0.0.1:8080",
+    "app_upstream": "127.0.0.1:0 (disabled)",
     "app_reachable": true
 }
 ```
@@ -344,6 +344,18 @@ The reverse proxy architecture eliminates several failure modes and design const
 - **Cert renewal reliability**: `certbot renew` uses webroot mode against the always-running proxy. No port binding needed.
 - **No application cooperation required**: The application serves HTTP on `APP_HTTP_PORT` with no knowledge of ACME, nonces, or ssl-manager internals.
 - **Nonce safety**: Nonces are stored in proxy memory (not files), eliminating file cleanup issues.
+
+**Proxy Hardening Requirements:**
+
+The ssl-http-proxy must implement the following protections since port 80 is publicly exposed:
+
+- **Request timeout**: 30-second timeout for upstream connections. If the app on APP_HTTP_PORT is slow/hung, the proxy returns 504 Gateway Timeout rather than blocking indefinitely.
+- **Connect timeout**: 5-second timeout for connecting to the upstream. Returns 502 immediately if the upstream is not listening.
+- **Max header size**: 8KB limit on request headers. Oversized headers are rejected with 431 Request Header Fields Too Large.
+- **Max request body**: 10MB default for proxied requests (configurable via `PROXY_MAX_BODY_SIZE`). ACME challenge paths have a 1KB limit (challenge tokens are always small).
+- **Threading**: Uses `ThreadingHTTPServer` (not the single-threaded default) to handle concurrent requests. A slow upstream does not block ACME challenge responses.
+- **No WebSocket support**: The proxy does not support WebSocket upgrade. Services requiring WebSocket on port 80 must use a dedicated reverse proxy (nginx, HAProxy) instead of ssl-manager's built-in proxy. WebSocket on other ports (e.g., Fulcrum's 50003/50004) is unaffected.
+- **Reserved port rejection**: APP_HTTP_PORT must not be 80 (circular), 8404 (HAProxy API), or any port listed in EXPOSE. The proxy rejects these at startup with a clear error.
 
 #### Step 2: Certificate Check and Acquisition
 
@@ -843,7 +855,7 @@ certbot renew --webroot --webroot-path /var/www/acme-challenge
 | `SSL_SKIP_VERIFY` | No | `false` | Skip TLS verification after cert acquisition. Useful in development where the domain may not be publicly reachable on port 443. |
 | `SSL_REQUIRED` | No | `true` (when `SSL_DOMAIN` set) | When `true`, SSL setup failure is fatal (container exits). When `false`, SSL setup failure logs a WARNING and the container continues in TCP-only mode. Only meaningful when `SSL_DOMAIN` is set. |
 | `SSL_STAGING` | No | `false` | Use Let's Encrypt staging environment. Produces untrusted certificates but avoids rate limits during testing. Adds `--staging` flag to certbot. |
-| `APP_HTTP_PORT` | No | `8080` | Internal port where the application's HTTP server listens. The ssl-manager proxy on port 80 forwards non-management traffic here. Set to 0 to disable proxying (proxy returns 404 for non-ssl paths). |
+| `APP_HTTP_PORT` | No | `0` | Internal port where the application's HTTP server listens. The ssl-manager proxy on port 80 forwards non-management traffic here. Set to 0 to disable proxying (proxy returns 404 for non-ssl paths). **Validation**: Must not be 80 (circular proxy), 8404 (HAProxy API), or any port used by ssl-manager internals. Valid range: 0 (disabled) or 1024-65535. |
 | `SSL_TEST_MODE` | No | `false` | **Development/CI only.** When `true`, generates a self-signed certificate instead of calling certbot. Useful for testing the SSL setup flow without needing a publicly reachable domain or Let's Encrypt access. Do not use in production. |
 | `HAPROXY_API_KEY` | No | (unset) | Shared secret for HAProxy Registration API authentication. When set, all API requests include an `Authorization: Bearer <key>` header. Strongly recommended for environments where multiple teams or untrusted containers share the Docker network. |
 | `RPC_HOST` | Yes | `alpha-node` | Alpha node RPC hostname (existing variable, unchanged). |
@@ -1139,6 +1151,8 @@ Port 80 inside the container runs the ssl-manager HTTP reverse proxy. This proxy
 - The `/_ssl/nonce/*` endpoints are used only during initial setup for domain reachability verification. Nonces are stored in memory and cleaned up after verification.
 - All other paths are forwarded to `localhost:$APP_HTTP_PORT`. If no application is listening, the proxy returns 502 Bad Gateway. The proxy does not expose any internal services beyond the configured upstream.
 - The proxy forwards requests transparently without modifying headers, methods, or bodies. It does not inject or strip security headers.
+
+> **Limitation:** The ssl-manager HTTP proxy does not support WebSocket upgrade on port 80. Services requiring WebSocket on port 80 should use HAProxy or nginx for the HTTP frontend instead of the ssl-manager proxy. WebSocket on dedicated ports (e.g., Fulcrum's 50003/50004) is unaffected.
 
 ---
 
