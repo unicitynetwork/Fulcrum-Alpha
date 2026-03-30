@@ -82,6 +82,7 @@ while true; do
     log "Checking certificate renewal..."
 
     if certbot renew \
+        --cert-name "${SSL_DOMAIN}" \
         --webroot \
         --webroot-path "$WEBROOT" \
         --deploy-hook "touch /tmp/.ssl-renewal-restart" \

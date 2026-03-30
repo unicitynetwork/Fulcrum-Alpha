@@ -159,14 +159,19 @@ CONF
 # Wait for Alpha node to be ready (if on same network)
 # ---------------------------------------------------------------------------
 wait_for_alpha() {
-    if nc -z "${RPC_HOST:-alpha-node}" "${RPC_PORT:-8589}" 2>/dev/null; then
-        echo "[entrypoint] Detected Alpha node, waiting for it to be ready..."
-        while ! nc -z "${RPC_HOST:-alpha-node}" "${RPC_PORT:-8589}" 2>/dev/null; do
-            echo "[entrypoint] Alpha node not ready, waiting..."
-            sleep 5
-        done
-        echo "[entrypoint] Alpha node is ready!"
-    fi
+    echo "[entrypoint] Waiting for Alpha node at ${RPC_HOST:-alpha-node}:${RPC_PORT:-8589}..."
+    local max_wait=120
+    local waited=0
+    while ! nc -z "${RPC_HOST:-alpha-node}" "${RPC_PORT:-8589}" 2>/dev/null; do
+        if [ "$waited" -ge "$max_wait" ]; then
+            echo "[entrypoint] WARNING: Alpha node not reachable after ${max_wait}s, proceeding anyway..."
+            return 0
+        fi
+        echo "[entrypoint] Alpha node not ready, waiting... ($waited/${max_wait}s)"
+        sleep 5
+        waited=$((waited + 5))
+    done
+    echo "[entrypoint] Alpha node is ready!"
 }
 
 # ---------------------------------------------------------------------------
@@ -275,9 +280,11 @@ run_fulcrum_supervised() {
 # Main execution
 # ===========================================================================
 
-# Step 1: Clean database on every start to prevent corruption issues
-echo "[entrypoint] Cleaning database on startup to ensure fresh state..."
-clean_database
+# Step 1: Optionally clean database on startup (disabled by default to preserve sync)
+if [ "${CLEAN_DB_ON_START:-false}" = "true" ]; then
+    echo "[entrypoint] CLEAN_DB_ON_START is set, cleaning database..."
+    clean_database
+fi
 
 # Step 2: Run ssl-setup from ssl-manager base image
 echo "[entrypoint] Running ssl-setup..."

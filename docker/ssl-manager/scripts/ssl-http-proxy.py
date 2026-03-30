@@ -150,7 +150,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         try:
             file_path = file_path.resolve()
             webroot_resolved = Path(webroot).resolve()
-            if not str(file_path).startswith(str(webroot_resolved)):
+            if not str(file_path).startswith(str(webroot_resolved) + os.sep):
                 self._send_text(403, "Forbidden")
                 return
         except (ValueError, OSError):
@@ -200,12 +200,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     # -- Nonce endpoints --
 
     def _handle_nonce_get(self, nonce: str):
-        """GET /_ssl/nonce/{nonce} -> 200 if exists, 404 if not."""
+        """GET /_ssl/nonce/{nonce} -> 200 with raw nonce text if exists, 404 if not."""
         with _nonce_lock:
             if nonce in _nonces:
-                self._send_json(200, {"nonce": nonce, "status": "valid"})
+                self._send_text(200, nonce)
             else:
-                self._send_error_json(404, "Nonce not found")
+                self.send_error(404, "Nonce not found")
 
     def _handle_nonce_post(self, nonce: str):
         """POST /_ssl/nonce/{nonce} -> store nonce, return 201."""

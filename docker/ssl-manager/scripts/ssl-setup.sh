@@ -109,6 +109,7 @@ python3 /usr/local/bin/ssl-http-proxy \
     --upstream "127.0.0.1:${APP_HTTP_PORT}" \
     --cert-dir "/etc/letsencrypt/live/${SSL_DOMAIN}" &
 HTTP_PROXY_PID=$!
+echo "$HTTP_PROXY_PID" > /tmp/.ssl-http-proxy.pid
 
 # Wait for the proxy to become ready (up to 5 seconds)
 proxy_ready=false
@@ -140,6 +141,13 @@ fi
 
 if [[ -n "$HAPROXY_DETECTED" ]]; then
     build_auth_header
+
+    # Validate EXTRA_PORTS JSON before using with jq
+    if [[ -n "${EXTRA_PORTS:-}" ]] && [[ "${EXTRA_PORTS}" != "null" ]]; then
+        if ! echo "$EXTRA_PORTS" | jq empty 2>/dev/null; then
+            die 13 "EXTRA_PORTS is not valid JSON: $EXTRA_PORTS"
+        fi
+    fi
 
     # Retry with exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s (capped)
     # Maximum total wait: 5 minutes (300 seconds)
@@ -348,6 +356,7 @@ fi
 log "Starting certificate renewal background loop"
 /usr/local/bin/ssl-renew &
 RENEWAL_PID=$!
+echo "$RENEWAL_PID" > /tmp/.ssl-renew.pid
 log "Renewal loop started (PID ${RENEWAL_PID})"
 
 # ---------------------------------------------------------------------------
