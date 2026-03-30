@@ -140,6 +140,16 @@ elif getent hosts haproxy &>/dev/null; then
 fi
 
 if [[ -n "$HAPROXY_DETECTED" ]]; then
+    # Wait for Docker DNS to fully initialize (network interfaces may not be
+    # ready immediately after container start, especially with multi-network)
+    log "Waiting for DNS resolution of ${HAPROXY_DETECTED}..."
+    for _dns_wait in $(seq 1 30); do
+        if getent hosts "$HAPROXY_DETECTED" &>/dev/null; then
+            log "DNS ready: $(getent hosts "$HAPROXY_DETECTED" | head -1)"
+            break
+        fi
+        sleep 1
+    done
     build_auth_header
 
     # Validate EXTRA_PORTS JSON before using with jq
@@ -149,9 +159,33 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
         fi
     fi
 
+    # Resolve hostname to IP for reliable curl
+    HAPROXY_IP=$(getent hosts "$HAPROXY_DETECTED" 2>/dev/null | awk '{print $1}' | head -1)
+    if [[ -z "$HAPROXY_IP" ]]; then
+        HAPROXY_IP="$HAPROXY_DETECTED"
+    fi
+    log "Resolved ${HAPROXY_DETECTED} → ${HAPROXY_IP}"
+
+    # Wait for actual TCP connectivity (not just DNS). Docker bridge networks
+    # may not have their routing table entries ready when the entrypoint starts,
+    # especially in multi-network setups. DNS works immediately (Docker's
+    # embedded DNS is network-independent) but L3 routing requires the veth
+    # pair and subnet route to be configured, which happens asynchronously.
+    log "Waiting for TCP connectivity to ${HAPROXY_IP}:${HAPROXY_API_PORT}..."
+    for _tcp_wait in $(seq 1 60); do
+        if nc -z -w1 "$HAPROXY_IP" "$HAPROXY_API_PORT" 2>/dev/null; then
+            log "TCP connectivity confirmed"
+            break
+        fi
+        if [[ "$_tcp_wait" -eq 60 ]]; then
+            log "WARNING: TCP connectivity not established after 60s"
+        fi
+        sleep 1
+    done
+
     # Retry with exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s (capped)
     # Maximum total wait: 5 minutes (300 seconds)
-    haproxy_url="http://${HAPROXY_DETECTED}:${HAPROXY_API_PORT}/v1/backends"
+    haproxy_url="http://${HAPROXY_IP}:${HAPROXY_API_PORT}/v1/backends"
     backoff=2
     total_waited=0
     max_wait=300
@@ -165,7 +199,7 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
         '{domain: $domain, container: $container, http_port: $http_port, https_port: null, extra_ports: $extra_ports}')
 
     while [[ "$total_waited" -lt "$max_wait" ]]; do
-        http_code=$(curl -sf -o /dev/null -w '%{http_code}' \
+        http_code=$(curl -s -o /dev/null -w '%{http_code}' \
             -X POST "${haproxy_url}" \
             -H "Content-Type: application/json" \
             "${AUTH_HEADER_ARGS[@]}" \
@@ -175,6 +209,18 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
             registered=true
             log "Registered with HAProxy (HTTP-only, status=${http_code})"
             break
+        fi
+
+        if [[ "$http_code" == "409" ]]; then
+            # Domain registered to a different (likely dead) container.
+            # Delete the stale registration and retry.
+            log "Domain conflict (409) — deleting stale registration for ${SSL_DOMAIN}..."
+            curl -s -o /dev/null -X DELETE \
+                "${haproxy_url}/${SSL_DOMAIN}" \
+                "${AUTH_HEADER_ARGS[@]}" \
+                --max-time 5 2>/dev/null || true
+            sleep 2
+            continue  # Retry registration immediately
         fi
 
         log "HAProxy API not ready (status=${http_code}), retrying in ${backoff}s..."
@@ -339,7 +385,7 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
         '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
 
     http_code=$(curl -sf -o /dev/null -w '%{http_code}' \
-        -X POST "http://${HAPROXY_DETECTED}:${HAPROXY_API_PORT}/v1/backends" \
+        -X POST "http://${HAPROXY_IP:-${HAPROXY_DETECTED}}:${HAPROXY_API_PORT}/v1/backends" \
         -H "Content-Type: application/json" \
         "${AUTH_HEADER_ARGS[@]}" \
         -d "$PAYLOAD" 2>/dev/null) || http_code="000"
