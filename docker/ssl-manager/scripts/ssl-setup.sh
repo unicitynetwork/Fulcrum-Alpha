@@ -213,8 +213,12 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
 
         if [[ "$http_code" == "409" ]]; then
             # Domain registered to a different (likely dead) container.
-            # Delete the stale registration and retry.
-            log "Domain conflict (409) — deleting stale registration for ${SSL_DOMAIN}..."
+            # Delete the stale registration and retry (max 3 attempts).
+            conflict_retries=$((${conflict_retries:-0} + 1))
+            if [[ "$conflict_retries" -gt 3 ]]; then
+                die 13 "Domain conflict persists after ${conflict_retries} delete attempts for ${SSL_DOMAIN}"
+            fi
+            log "Domain conflict (409) — deleting stale registration (attempt ${conflict_retries}/3)..."
             curl -s -o /dev/null -X DELETE \
                 "${haproxy_url}/${SSL_DOMAIN}" \
                 "${AUTH_HEADER_ARGS[@]}" \
@@ -384,11 +388,11 @@ if [[ -n "$HAPROXY_DETECTED" ]]; then
         --argjson extra_ports "${EXTRA_PORTS:-null}" \
         '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port, extra_ports: $extra_ports}')
 
-    http_code=$(curl -sf -o /dev/null -w '%{http_code}' \
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' \
         -X POST "http://${HAPROXY_IP:-${HAPROXY_DETECTED}}:${HAPROXY_API_PORT}/v1/backends" \
         -H "Content-Type: application/json" \
         "${AUTH_HEADER_ARGS[@]}" \
-        -d "$PAYLOAD" 2>/dev/null) || http_code="000"
+        -d "$PAYLOAD" --max-time 10 2>/dev/null) || http_code="000"
 
     if [[ "$http_code" != "200" && "$http_code" != "201" ]]; then
         die 13 "HAProxy HTTPS registration failed (status=${http_code})"
