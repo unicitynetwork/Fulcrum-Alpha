@@ -417,7 +417,7 @@ if [ -n "$HAPROXY_DETECTED" ]; then
         --argjson https_port "${SERVICE_SSL_PORT}" \
         '{domain: $domain, container: $container, http_port: $http_port, https_port: $https_port}')
 
-    curl -sf -X POST "http://${HAPROXY_HOST}:8404/v1/backends" \
+    curl -sf -X POST "http://${HAPROXY_HOST}:${HAPROXY_API_PORT:-8404}/v1/backends" \
       -H "Content-Type: application/json" \
       ${HAPROXY_API_KEY:+-H "Authorization: Bearer $HAPROXY_API_KEY"} \
       -d "$PAYLOAD"
@@ -622,9 +622,9 @@ No request body. Runs `generate-config.sh` and reloads HAProxy unconditionally.
 
 #### API Implementation Notes
 
-- The API server is a single Python file: `/usr/local/bin/haproxy-api-server.py`.
-- It reads/writes `domains.map` directly using file locking (`fcntl.flock`) to prevent concurrent writes.
-- It calls `generate-config.sh` as a subprocess to regenerate `/etc/haproxy/conf.d/`.
+- The API server is a single Node.js ES module: `/usr/local/bin/registration-api.mjs`.
+- It reads/writes `domains.map` directly using file locking (`O_EXCL` lock file) to prevent concurrent writes.
+- It calls `generate-config.sh` via `child_process.execFile` to regenerate `/etc/haproxy/conf.d/`.
 - It sends SIGUSR2 to the HAProxy master process for reload.
 - It binds to `0.0.0.0:8404` but is only reachable on `haproxy-net` because port 8404 is not published in `docker-compose.yml`.
 - Optional authentication via `HAPROXY_API_KEY` environment variable (Bearer token in Authorization header). When not set, the API is trusted based on Docker network isolation -- it is only reachable from containers on the internal `haproxy-net` Docker network.
@@ -634,28 +634,23 @@ No request body. Runs `generate-config.sh` and reloads HAProxy unconditionally.
 ```yaml
 services:
   haproxy:
-    image: haproxy:lts
+    build:
+      context: ../haproxy
+      dockerfile: Dockerfile
+    image: haproxy-api:latest
     container_name: haproxy
-    restart: "on-failure:5"
+    restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
-      - "8000:8000"
-      # 8404 NOT published -- internal API only
+      # Port 8404 (Registration API) is NOT published — internal network only
     volumes:
-      - ./conf.d:/etc/haproxy/conf.d
-      - ./maps:/etc/haproxy/maps
-      - ./domains.map:/etc/haproxy/domains.map
-      - ./generate-config.sh:/usr/local/bin/generate-config.sh:ro
-      - ./api/haproxy-api-server.py:/usr/local/bin/haproxy-api-server.py:ro
-    # Override entrypoint to start both HAProxy and the API server
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - |
-        python3 /usr/local/bin/haproxy-api-server.py &
-        haproxy -W -f /etc/haproxy/conf.d
+      - haproxy-data:/etc/haproxy
     networks:
       - haproxy-net
+
+volumes:
+  haproxy-data:
 
 networks:
   haproxy-net:
@@ -663,12 +658,11 @@ networks:
 ```
 
 Key changes:
-- Base image is `haproxy:lts`. The stock HAProxy image uses `/usr/local/etc/haproxy/` as its config directory. The Dockerfile adds a symlink so that `/etc/haproxy/conf.d` (the canonical path used in this spec) is reachable: `RUN ln -s /etc/haproxy/conf.d /usr/local/etc/haproxy/conf.d`.
-- `conf.d` and `maps` volumes are now read-write (removed `:ro`) so the API can regenerate config.
-- `domains.map` is mounted directly so the API can append entries.
-- HAProxy runs in master-worker mode (`-W`) to support SIGUSR2 reloads.
-- The API server starts as a background process before HAProxy.
-- Restart policy is `on-failure:5` (not `always` or `unless-stopped`) to avoid infinite retry loops on permanent configuration errors.
+- Custom image built from `haproxy/Dockerfile` (based on `haproxy:lts`). The Dockerfile COPYs the Node.js Registration API, `generate-config.sh`, and the bash entrypoint into the image. A symlink maps `/etc/haproxy/conf.d` to HAProxy's native config path.
+- The entrypoint starts the Node.js Registration API in a restart loop, then exec's into HAProxy in master-worker mode (`-W`) to support SIGUSR2 reloads.
+- `haproxy-data` named volume persists configuration state across restarts.
+- Port 8404 is NOT published -- the Registration API is accessible only on `haproxy-net`.
+- Restart policy is `unless-stopped` (core infrastructure that should always be running).
 
 ### 4.2 HAProxy Routing for Fulcrum
 
@@ -1239,7 +1233,7 @@ docker-entrypoint.sh
 7. Add recognition of `/tmp/.ssl-renewal-restart` in the supervisor loop.
 
 **Phase 4: Add HAProxy Registration API**
-1. Create `haproxy/api/haproxy-api-server.py`.
+1. Create `haproxy/registration-api.mjs` (Node.js ES module).
 2. Update `haproxy/docker-compose.yml` to mount and start the API.
 3. Run `generate-config.sh` to ensure it works when called by the API.
 4. Test registration, update, deletion, and reload.
@@ -1295,8 +1289,7 @@ ssl-manager/
 
 ```
 haproxy/
-  api/
-    haproxy-api-server.py  # Registration API server
+  registration-api.mjs     # Registration API server (Node.js ES module)
   docker-compose.yml       # Updated with API server and -W flag
 ```
 
