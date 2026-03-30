@@ -489,7 +489,7 @@ The service entrypoint reads `SSL_CERT_PATH` and `SSL_KEY_PATH` and writes them 
 
 The HAProxy container currently has no runtime API. A new lightweight registration API must be added. This API runs as a sidecar process inside the HAProxy container.
 
-**API Server:** A Python 3 HTTP server using only the standard library (`http.server`). No external dependencies. Runs as a background process started by the HAProxy entrypoint.
+**API Server:** A Node.js HTTP server using only built-in modules (`node:http`, `node:fs`, `node:child_process`). No npm dependencies. Runs as a background process started by the HAProxy entrypoint. Node.js aligns with the Unicity stack (TypeScript/Node.js across 5+ repos) and avoids adding Python to the HAProxy container.
 
 **Endpoint:** `http://haproxy:8404/v1/backends`
 
