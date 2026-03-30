@@ -900,7 +900,7 @@ certbot renew --webroot --webroot-path /var/www/acme-challenge
 | `SSL_ADMIN_EMAIL` | No | (unset) | Email for Let's Encrypt registration. If unset, registers without email (less secure -- no expiry notifications from Let's Encrypt). |
 | `HAPROXY_HOST` | No | `haproxy` | Hostname of the HAProxy container. Default is `haproxy`. If unset, `ssl-setup` attempts to resolve `haproxy` via DNS. If resolution fails, assumes no HAProxy (direct mode). |
 | `HAPROXY_API_PORT` | No | `8404` | Port of the HAProxy Registration API. |
-| `SSL_SERVICE_PORT` | No | `50002` | The port inside the container where the service listens for TLS connections. HAProxy registers this as the HTTPS backend port. For Fulcrum, this is the Electrum SSL port. |
+| `SSL_SERVICE_PORT` | No | `443` | The port inside the container where the service listens for TLS connections. HAProxy registers this as the HTTPS backend port. Generic default is 443; Fulcrum overrides to 50002 via `SSL_HTTPS_PORT`. |
 | `SSL_SKIP_VERIFY` | No | `false` | Skip TLS verification after cert acquisition. Useful in development where the domain may not be publicly reachable on port 443. |
 | `SSL_REQUIRED` | No | `true` (when `SSL_DOMAIN` set) | When `true`, SSL setup failure is fatal (container exits). When `false`, SSL setup failure logs a WARNING and the container continues in TCP-only mode. Only meaningful when `SSL_DOMAIN` is set. |
 | `SSL_STAGING` | No | `false` | Use Let's Encrypt staging environment. Produces untrusted certificates but avoids rate limits during testing. Adds `--staging` flag to certbot. |
@@ -1086,7 +1086,11 @@ Note: Ports 50001, 50003, and 50004 are dynamically created by HAProxy when a ba
 | 50004 | WSS | Electrum WSS |
 | 80 | HTTP | ssl-manager HTTP reverse proxy (ACME challenges, `/_ssl/*` management, app forwarding) |
 
-When HAProxy is present, no Fulcrum ports need to be published to the host. All external traffic flows through HAProxy. Internal traffic on `alpha-net` (RPC to the Alpha node) stays on the private network.
+When HAProxy is present, Electrum SSL (50002), WS (50003), and WSS (50004) traffic
+is routed through HAProxy and does not need to be published on the Fulcrum container.
+Electrum TCP (50001) is optionally published directly for legacy clients that connect
+to a specific IP:port rather than a domain — this provides a direct-access fallback
+alongside the HAProxy-routed path. Internal traffic on `alpha-net` (RPC to the Alpha node) stays on the private network.
 
 **Fulcrum container (without HAProxy -- ports published to host):**
 
@@ -1411,7 +1415,7 @@ docker/
 - `SSL_STAGING` -- optional (default: false)
 - `SSL_HTTPS_PORT` -- optional (default: 443, set to 50002 for Fulcrum)
 - `EXTRA_PORTS` -- optional (JSON array of extra port mappings for HAProxy)
-- `APP_HTTP_PORT` -- optional (default: 8080, set to 0 to disable app forwarding)
+- `APP_HTTP_PORT` -- optional (default: 0, set to 0 to disable app forwarding)
 
 **Outputs (environment variables, exported on success):**
 - `SSL_CERT_PATH` -- absolute path to fullchain.pem
