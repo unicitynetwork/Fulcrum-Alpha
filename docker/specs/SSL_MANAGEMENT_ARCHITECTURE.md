@@ -44,15 +44,17 @@ Additionally, the host must have certbot installed and configured. Certificate r
 
 ### 2.1 Layer 1: `ssl-manager` Base Image
 
-A generic Debian-based image containing all SSL management tooling. Any service that needs automated SSL inherits from this image.
+A generic Debian-based image containing all SSL management tooling and an HTTP reverse proxy that shares port 80 between ssl-manager's `/_ssl/` management paths and the application's HTTP traffic. Any service that needs automated SSL inherits from this image.
 
 **Contents:**
 - certbot (via `apt`)
 - curl, jq, openssl, netcat-openbsd (utilities)
+- `APP_HTTP_PORT` environment variable (default: 8080) for reverse proxy upstream configuration
 - `/usr/local/bin/ssl-setup` -- main SSL orchestration script
 - `/usr/local/bin/ssl-renew` -- certificate renewal script
 - `/usr/local/bin/haproxy-register` -- HAProxy registration client
 - `/usr/local/bin/ssl-verify` -- domain reachability and TLS verification
+- `/usr/local/bin/ssl-http-proxy` -- HTTP reverse proxy (ACME + nonce + health + app forwarding)
 
 **Dockerfile pseudocode:**
 
@@ -75,11 +77,13 @@ COPY scripts/ssl-setup.sh       /usr/local/bin/ssl-setup
 COPY scripts/ssl-renew.sh       /usr/local/bin/ssl-renew
 COPY scripts/haproxy-register.sh /usr/local/bin/haproxy-register
 COPY scripts/ssl-verify.sh      /usr/local/bin/ssl-verify
+COPY scripts/ssl-http-proxy.py  /usr/local/bin/ssl-http-proxy
 
 RUN chmod +x /usr/local/bin/ssl-setup \
              /usr/local/bin/ssl-renew \
              /usr/local/bin/haproxy-register \
-             /usr/local/bin/ssl-verify
+             /usr/local/bin/ssl-verify \
+             /usr/local/bin/ssl-http-proxy
 
 # Let's Encrypt certificate storage -- mount a volume here
 VOLUME ["/etc/letsencrypt"]
@@ -123,7 +127,7 @@ COPY docker/fulcrum.conf.default /etc/fulcrum/fulcrum.conf.default
 VOLUME ["/data"]
 
 EXPOSE 50001 50002 50003 50004
-# 80 is used by the persistent HTTP server for certbot HTTP-01 challenges and HAProxy health checks
+# 80 is used by the ssl-manager HTTP reverse proxy (ACME challenges + app traffic forwarding)
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD nc -z localhost 50001 || exit 1
@@ -147,6 +151,7 @@ CMD ["Fulcrum"]
 |  ssl-manager:latest                              |
 |  - certbot, curl, jq, openssl, netcat, python3   |
 |  - ssl-setup, ssl-renew, haproxy-register        |
+|  - ssl-http-proxy (reverse proxy on port 80)     |
 |  - /etc/letsencrypt volume                       |
 +--------------------------------------------------+
 |  debian:trixie-slim                              |
@@ -179,16 +184,16 @@ sequenceDiagram
         alt HAPROXY_HOST set or "haproxy" resolves
             S->>H: POST /v1/backends (register HTTP)
             H-->>S: 201 Created (or 200 already registered)
-            S->>S: Start persistent HTTP server on port 80
-            S->>S: Write nonce to webroot, curl http://SSL_DOMAIN/nonce-NONCE
+            S->>S: Start HTTP reverse proxy on port 80
+            S->>S: POST nonce to /_ssl/nonce, curl http://SSL_DOMAIN/_ssl/nonce/NONCE
             alt nonce matches
                 S->>S: Domain reachable via HAProxy
             else nonce mismatch or timeout
                 S->>S: EXIT 10 (domain unreachable)
             end
         else No HAProxy
-            S->>S: Start persistent HTTP server on port 80
-            S->>S: Write nonce to webroot, curl http://SSL_DOMAIN/nonce-NONCE
+            S->>S: Start HTTP reverse proxy on port 80
+            S->>S: POST nonce to /_ssl/nonce, curl http://SSL_DOMAIN/_ssl/nonce/NONCE
             alt nonce matches
                 S->>S: Domain reachable directly
             else nonce mismatch or timeout
@@ -250,38 +255,50 @@ The `https_port: null` indicates "HTTP only for now." HTTPS passthrough is regis
 
 **Persistent HTTP server and reachability verification:**
 
-A persistent lightweight HTTP server runs on port 80 for the lifetime of the container. It serves three purposes: (1) nonce verification during initial setup, (2) certbot HTTP-01 challenges (initial and renewal), and (3) HAProxy health checks (keeps the backend marked as UP).
+A persistent HTTP reverse proxy runs on port 80 for the lifetime of the container. It serves four purposes:
+
+1. **ACME challenges**: Serves certbot HTTP-01 challenge files from `/.well-known/acme-challenge/` (webroot mode).
+2. **Nonce verification**: Provides `/_ssl/nonce/{nonce}` endpoints for domain reachability testing during setup.
+3. **SSL health**: Exposes `/_ssl/health` with certificate status (expiry date, days remaining, renewal status).
+4. **Application proxying**: Forwards all other HTTP traffic transparently to the application server at `localhost:$APP_HTTP_PORT` (default: 8080).
+
+The application's HTTP server (if any) binds to `APP_HTTP_PORT` (default 8080) and has zero awareness of ssl-manager. It receives proxied requests with original headers, methods, and bodies intact. If no application is listening on `APP_HTTP_PORT`, the proxy returns 502 Bad Gateway for non-ssl-manager paths -- this is expected during SSL setup before the main service starts.
+
+This design allows the application to use port 80 for its own HTTP traffic while ssl-manager transparently handles certificate operations on the same port. The application never needs to serve `/.well-known/acme-challenge/` or any other ssl-manager path.
 
 ```bash
 WEBROOT="/var/www/acme-challenge"
 mkdir -p "$WEBROOT/.well-known/acme-challenge"
 
-# Start persistent HTTP server (runs for the lifetime of the container)
-python3 -c "
-import http.server, os, threading
+# Start the ssl-manager HTTP reverse proxy on port 80.
+# Routes:
+#   /.well-known/acme-challenge/* → serve from $WEBROOT (certbot)
+#   /_ssl/health                  → ssl-manager status JSON
+#   /_ssl/nonce/*                 → nonce verification (setup only)
+#   /*                            → reverse proxy to localhost:$APP_HTTP_PORT
+APP_HTTP_PORT="${APP_HTTP_PORT:-8080}"
 
-WEBROOT = os.environ.get('WEBROOT', '/var/www/acme-challenge')
+python3 /usr/local/bin/ssl-http-proxy \
+    --port 80 \
+    --webroot "$WEBROOT" \
+    --upstream "127.0.0.1:${APP_HTTP_PORT}" \
+    --cert-dir "/etc/letsencrypt/live/${SSL_DOMAIN:-}" &
+HTTP_PROXY_PID=$!
 
-class Handler(http.server.SimpleHTTPRequestHandler):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=WEBROOT, **kwargs)
-    def log_message(self, *a): pass
+# Wait for the proxy to be ready
+for i in $(seq 1 10); do
+    if nc -z localhost 80 2>/dev/null; then break; fi
+    sleep 0.5
+done
 
-server = http.server.HTTPServer(('0.0.0.0', 80), Handler)
-server.serve_forever()
-" &
-HTTP_SERVER_PID=$!
-
-# Generate a nonce and write it to the webroot for verification
 NONCE=$(openssl rand -hex 16)
-echo "$NONCE" > "$WEBROOT/nonce-$NONCE"
+# Register the nonce with the proxy (it stores it in memory, no files)
+curl -sf -X POST "http://localhost:80/_ssl/nonce/${NONCE}" >/dev/null
 
-# Retry loop: HAProxy reload may not be instantaneous.  The Registration API
-# should block until HAProxy's new workers are accepting, but we add retries
-# as a defense-in-depth measure.
+# Verify: request the nonce through the public domain (proves end-to-end reachability)
 NONCE_MATCHED=false
 for ATTEMPT in 1 2 3; do
-    RESPONSE=$(curl -sf --max-time 10 "http://${SSL_DOMAIN}/nonce-${NONCE}" || true)
+    RESPONSE=$(curl -sf --max-time 10 "http://${SSL_DOMAIN}/_ssl/nonce/${NONCE}" || true)
     if [ "$RESPONSE" = "$NONCE" ]; then
         NONCE_MATCHED=true
         break
@@ -290,8 +307,8 @@ for ATTEMPT in 1 2 3; do
     sleep 5
 done
 
-# Clean up nonce file
-rm -f "$WEBROOT/nonce-$NONCE"
+# Clean up nonce from proxy memory
+curl -sf -X DELETE "http://localhost:80/_ssl/nonce/${NONCE}" >/dev/null 2>&1 || true
 
 if [ "$NONCE_MATCHED" != "true" ]; then
     echo "ERROR: Domain ${SSL_DOMAIN} is not routable to this container"
@@ -305,11 +322,28 @@ fi
 
 The nonce verification is essential. It confirms end-to-end reachability: the Internet can reach port 80 of this container through either HAProxy or direct exposure. Without this, certbot would fail with an opaque ACME error.
 
-The persistent HTTP server eliminates several failure modes:
-- Port 80 contention between the nonce server and certbot (certbot uses webroot mode, no port binding needed).
-- HAProxy health checks marking port 80 as DOWN between certbot runs -- the server is always listening.
-- Cert renewal failure -- `certbot renew` uses webroot mode against the always-running server.
-- Nonce injection vulnerability -- the nonce is written to a file, not interpolated into Python code.
+**`/_ssl/health` endpoint:** The reverse proxy exposes a health/status endpoint at `/_ssl/health` that returns certificate status as JSON:
+
+```json
+{
+    "status": "ok",
+    "domain": "example.com",
+    "cert_expires": "2026-06-28T12:00:00Z",
+    "days_remaining": 89,
+    "last_renewal_check": "2026-03-30T03:42:00Z",
+    "app_upstream": "127.0.0.1:8080",
+    "app_reachable": true
+}
+```
+
+This provides a monitoring endpoint for certificate expiry without requiring shell access to the container. The `app_reachable` field indicates whether the upstream application server is responding on `APP_HTTP_PORT`.
+
+The reverse proxy architecture eliminates several failure modes and design constraints:
+- **Port 80 sharing**: The application and ssl-manager coexist on port 80 without awareness of each other. No port conflicts.
+- **HAProxy health checks**: Port 80 is always listening, so HAProxy never marks the backend as DOWN.
+- **Cert renewal reliability**: `certbot renew` uses webroot mode against the always-running proxy. No port binding needed.
+- **No application cooperation required**: The application serves HTTP on `APP_HTTP_PORT` with no knowledge of ACME, nonces, or ssl-manager internals.
+- **Nonce safety**: Nonces are stored in proxy memory (not files), eliminating file cleanup issues.
 
 #### Step 2: Certificate Check and Acquisition
 
@@ -628,11 +662,12 @@ Key changes:
 
 Fulcrum uses non-standard ports (50001-50004) rather than 80/443. The HAProxy integration handles this as follows:
 
-**HTTP (port 80) -- persistent HTTP server for certbot challenges:**
+**HTTP (port 80) -- ssl-manager HTTP reverse proxy:**
 - HAProxy routes `domain:80` to `fulcrum-alpha:80` (HTTP mode).
-- Inside the Fulcrum container, a persistent lightweight HTTP server runs on port 80 for the lifetime of the container, serving the webroot at `/var/www/acme-challenge`.
-- Certbot uses webroot mode to write challenge files; the HTTP server serves them.
-- The server is always listening, so HAProxy health checks keep the backend marked as UP.
+- Inside the Fulcrum container, the ssl-manager HTTP reverse proxy runs on port 80 for the lifetime of the container.
+- The proxy intercepts `/.well-known/acme-challenge/*` (certbot webroot), `/_ssl/*` (management endpoints), and forwards everything else to `localhost:$APP_HTTP_PORT`.
+- Certbot uses webroot mode to write challenge files; the proxy serves them.
+- The proxy is always listening, so HAProxy health checks keep the backend marked as UP.
 
 **HTTPS (port 443) -- Electrum SSL:**
 - HAProxy routes `domain:443` to `fulcrum-alpha:50002` (TCP passthrough mode, SNI-based).
@@ -667,7 +702,7 @@ Certificates are obtained via Let's Encrypt using the ACME HTTP-01 challenge:
 3. Let's Encrypt makes an HTTP request to `http://<domain>/.well-known/acme-challenge/<token>`.
 4. This request arrives at HAProxy:80 (or directly at the container:80 if no HAProxy).
 5. HAProxy routes it to the container based on Host header.
-6. The persistent HTTP server on port 80 serves the challenge file from the webroot.
+6. The ssl-manager HTTP reverse proxy on port 80 intercepts the `/.well-known/acme-challenge/` path and serves the challenge file from the webroot.
 7. Let's Encrypt validates and issues the certificate.
 8. Certbot writes the certificate to `/etc/letsencrypt/live/<domain>/`.
 
@@ -780,13 +815,14 @@ fi
 
 ### 5.4 Renewal and Port 80
 
-During renewal, certbot uses **webroot mode**. A persistent lightweight HTTP server runs on port 80 for the lifetime of the container, serving `/.well-known/acme-challenge/` from `/var/www/acme-challenge`. Certbot writes challenge files to this directory; the HTTP server serves them to Let's Encrypt.
+During renewal, certbot uses **webroot mode**. The ssl-manager HTTP reverse proxy runs on port 80 for the lifetime of the container, intercepting `/.well-known/acme-challenge/` requests and serving them from `/var/www/acme-challenge`. Certbot writes challenge files to this directory; the proxy serves them to Let's Encrypt. All other traffic on port 80 is forwarded to the application at `localhost:$APP_HTTP_PORT`.
 
 This approach eliminates all port contention issues:
-- The HTTP server starts once during `ssl-setup` and never stops.
+- The reverse proxy starts once during `ssl-setup` and never stops.
 - Certbot does not bind to any port -- it only writes files to the webroot.
 - HAProxy health checks see port 80 as always UP, preventing false-negative backend marking.
 - No pre/post hooks needed for port management.
+- The application can serve its own HTTP traffic on port 80 transparently through the proxy.
 
 The renewal loop (see Section 5.3) invokes:
 ```bash
@@ -807,6 +843,7 @@ certbot renew --webroot --webroot-path /var/www/acme-challenge
 | `SSL_SKIP_VERIFY` | No | `false` | Skip TLS verification after cert acquisition. Useful in development where the domain may not be publicly reachable on port 443. |
 | `SSL_REQUIRED` | No | `true` (when `SSL_DOMAIN` set) | When `true`, SSL setup failure is fatal (container exits). When `false`, SSL setup failure logs a WARNING and the container continues in TCP-only mode. Only meaningful when `SSL_DOMAIN` is set. |
 | `SSL_STAGING` | No | `false` | Use Let's Encrypt staging environment. Produces untrusted certificates but avoids rate limits during testing. Adds `--staging` flag to certbot. |
+| `APP_HTTP_PORT` | No | `8080` | Internal port where the application's HTTP server listens. The ssl-manager proxy on port 80 forwards non-management traffic here. Set to 0 to disable proxying (proxy returns 404 for non-ssl paths). |
 | `SSL_TEST_MODE` | No | `false` | **Development/CI only.** When `true`, generates a self-signed certificate instead of calling certbot. Useful for testing the SSL setup flow without needing a publicly reachable domain or Let's Encrypt access. Do not use in production. |
 | `HAPROXY_API_KEY` | No | (unset) | Shared secret for HAProxy Registration API authentication. When set, all API requests include an `Authorization: Bearer <key>` header. Strongly recommended for environments where multiple teams or untrusted containers share the Docker network. |
 | `RPC_HOST` | Yes | `alpha-node` | Alpha node RPC hostname (existing variable, unchanged). |
@@ -934,7 +971,7 @@ graph TB
         end
 
         subgraph alpha-net["alpha-net (Docker bridge network)"]
-            Fulcrum_an["fulcrum-alpha<br/>:50001 TCP<br/>:50002 SSL<br/>:50003 WS<br/>:50004 WSS<br/>:80 HTTP server (certbot webroot)"]
+            Fulcrum_an["fulcrum-alpha<br/>:50001 TCP<br/>:50002 SSL<br/>:50003 WS<br/>:50004 WSS<br/>:80 HTTP reverse proxy (ACME + app)"]
             AlphaNode["alpha-node<br/>:8589 RPC"]
         end
     end
@@ -973,7 +1010,7 @@ Note: `fulcrum-alpha` is a single container connected to both networks. The two 
 | 50002 | SSL/TLS | Electrum encrypted |
 | 50003 | WebSocket | Electrum WS |
 | 50004 | WSS | Electrum WSS |
-| 80 | HTTP | Persistent HTTP server (certbot webroot, HAProxy health checks) |
+| 80 | HTTP | ssl-manager HTTP reverse proxy (ACME challenges, `/_ssl/*` management, app forwarding) |
 
 When HAProxy is present, no Fulcrum ports need to be published to the host. All external traffic flows through HAProxy. Internal traffic on `alpha-net` (RPC to the Alpha node) stays on the private network.
 
@@ -981,7 +1018,7 @@ When HAProxy is present, no Fulcrum ports need to be published to the host. All 
 
 | Host Port | Container Port | Protocol | Purpose |
 |---|---|---|---|
-| 80 | 80 | HTTP | Persistent HTTP server (certbot webroot) |
+| 80 | 80 | HTTP | ssl-manager HTTP reverse proxy (ACME challenges + app forwarding) |
 | 50001 | 50001 | TCP | Electrum unencrypted |
 | 50002 | 50002 | SSL/TLS | Electrum encrypted |
 | 50003 | 50003 | WebSocket | Electrum WS |
@@ -1003,7 +1040,12 @@ Client -> host:443 -> HAProxy:443 (TCP mode, inspect SNI)
 Let's Encrypt -> host:80 -> HAProxy:80 (HTTP mode, inspect Host header)
   -> Host matches "electrum.example.com"
   -> route to backend "fulcrum-alpha:80" on haproxy-net
-  -> persistent HTTP server serves challenge file from webroot
+  -> ssl-http-proxy intercepts /.well-known/acme-challenge/* -> serves from webroot
+
+Internet → HAProxy:80 → container:80 (ssl-http-proxy)
+                                      ├── /.well-known/acme-challenge/* → webroot files
+                                      ├── /_ssl/* → ssl-manager handlers
+                                      └── /* → localhost:APP_HTTP_PORT (app)
 ```
 
 **Fulcrum to Alpha node RPC:**
@@ -1090,11 +1132,13 @@ Mitigations:
 
 ### 9.5 Port 80 Exposure
 
-Port 80 inside the container runs a persistent lightweight HTTP server that serves files from `/var/www/acme-challenge`. This server is always listening when `SSL_DOMAIN` is set. The attack surface is limited:
+Port 80 inside the container runs the ssl-manager HTTP reverse proxy. This proxy is always listening when `SSL_DOMAIN` is set. The attack surface is limited:
 
-- The server only serves static files from the webroot directory. It does not execute scripts or serve dynamic content.
-- The webroot contains only certbot challenge files (written transiently during ACME validation) and is otherwise empty.
-- The server uses Python's `SimpleHTTPRequestHandler` which only supports GET/HEAD and only serves files from the configured directory.
+- The `/.well-known/acme-challenge/` path only serves static files from the webroot directory. It does not execute scripts or serve dynamic content.
+- The `/_ssl/health` endpoint returns read-only certificate status JSON. It exposes no secrets.
+- The `/_ssl/nonce/*` endpoints are used only during initial setup for domain reachability verification. Nonces are stored in memory and cleaned up after verification.
+- All other paths are forwarded to `localhost:$APP_HTTP_PORT`. If no application is listening, the proxy returns 502 Bad Gateway. The proxy does not expose any internal services beyond the configured upstream.
+- The proxy forwards requests transparently without modifying headers, methods, or bodies. It does not inject or strip security headers.
 
 ---
 
@@ -1230,6 +1274,7 @@ ssl-manager/
     ssl-renew-hook.sh      # Post-renewal deploy hook
     haproxy-register.sh    # HAProxy API client
     ssl-verify.sh          # Domain reachability and TLS verification
+    ssl-http-proxy.py      # HTTP reverse proxy (ACME + nonce + health + app forwarding)
 ```
 
 ### HAProxy additions
@@ -1264,6 +1309,7 @@ docker/
 - `SSL_SERVICE_PORT` -- optional (default: 443)
 - `SSL_SKIP_VERIFY` -- optional (default: false)
 - `SSL_STAGING` -- optional (default: false)
+- `APP_HTTP_PORT` -- optional (default: 8080, set to 0 to disable app forwarding)
 
 **Outputs (environment variables, exported on success):**
 - `SSL_CERT_PATH` -- absolute path to fullchain.pem

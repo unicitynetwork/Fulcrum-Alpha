@@ -57,6 +57,12 @@ SSL_STAGING="${SSL_STAGING:-}"
 #   cert instead of calling certbot. Never use in production.
 SSL_TEST_MODE="${SSL_TEST_MODE:-}"
 
+# ── Application HTTP port ────────────────────────────────────────────────────
+# APP_HTTP_PORT: internal port where the application serves HTTP behind the
+#   ssl-manager reverse proxy on port 80. The proxy forwards non-ssl traffic
+#   here. For Fulcrum, this is unused (Fulcrum serves Electrum protocol, not HTTP).
+APP_HTTP_PORT="${APP_HTTP_PORT:-8080}"
+
 # ── HAProxy settings ─────────────────────────────────────────────────────────
 # HAPROXY_HOST: hostname of the HAProxy container on the Docker network.
 #   Set to empty or use --no-haproxy to skip HAProxy integration.
@@ -106,6 +112,8 @@ while [[ $# -gt 0 ]]; do
         --ssl-required)   require_arg "$1" "${2:-}"; SSL_REQUIRED="$2";      shift 2 ;;
         --no-ssl)         SSL_DOMAIN="";          shift ;;
 
+        --app-http-port)  require_arg "$1" "${2:-}"; APP_HTTP_PORT="$2"; shift 2 ;;
+
         --haproxy-host)   require_arg "$1" "${2:-}"; HAPROXY_HOST="$2";      shift 2 ;;
         --haproxy-net)    require_arg "$1" "${2:-}"; HAPROXY_NET="$2";       shift 2 ;;
         --haproxy-api-key) require_arg "$1" "${2:-}"; HAPROXY_API_KEY="$2";  shift 2 ;;
@@ -148,6 +156,9 @@ SSL Configuration:
   --ssl-test-mode          Self-signed cert for dev/CI (never use in prod)
   --ssl-required <bool>    Fail if SSL setup fails (default: true)
   --no-ssl                 Run without SSL (TCP + WS only)
+
+Application:
+  --app-http-port <port>   App HTTP port behind ssl-manager proxy (default: 8080)
 
 HAProxy Configuration:
   --haproxy-host <host>    HAProxy hostname (default: haproxy)
@@ -264,6 +275,7 @@ ENV_ARGS=(
 if [ -n "$SSL_DOMAIN" ]; then
     ENV_ARGS+=( -e "SSL_DOMAIN=$SSL_DOMAIN" )
     ENV_ARGS+=( -e "SSL_REQUIRED=$SSL_REQUIRED" )
+    ENV_ARGS+=( -e "APP_HTTP_PORT=$APP_HTTP_PORT" )
     [ -n "$SSL_ADMIN_EMAIL" ] && ENV_ARGS+=( -e "SSL_ADMIN_EMAIL=$SSL_ADMIN_EMAIL" )
     [ -n "$SSL_STAGING" ]     && ENV_ARGS+=( -e "SSL_STAGING=$SSL_STAGING" )
     [ -n "$SSL_TEST_MODE" ]   && ENV_ARGS+=( -e "SSL_TEST_MODE=$SSL_TEST_MODE" )
@@ -281,7 +293,8 @@ fi
 
 # In HAProxy mode, HAProxy owns 80/443 — we only publish Electrum ports for
 # direct client access (if desired). Port 80 inside the container is used by
-# ssl-manager for certbot challenges but is reached via HAProxy, not published.
+# ssl-manager's HTTP reverse proxy (ACME challenges + app traffic forwarding)
+# and is reached via HAProxy, not published directly.
 #
 # In direct mode, we also publish port 80 when SSL is enabled (for certbot).
 
