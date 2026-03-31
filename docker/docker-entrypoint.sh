@@ -225,16 +225,20 @@ run_fulcrum_supervised() {
         EXIT_CODE=$?
         FULCRUM_PID=""
 
-        # Check if shutdown was requested
+        # Check for SSL renewal restart FIRST (before shutdown check).
+        # The deploy hook sends SIGTERM (sets SHUTDOWN_REQUESTED=1) but also
+        # touches the marker file. We must detect this BEFORE breaking out.
+        if [ -f /tmp/.ssl-renewal-restart ]; then
+            rm -f /tmp/.ssl-renewal-restart
+            echo "[entrypoint] SSL certificate renewed — restarting Fulcrum to load new cert"
+            SHUTDOWN_REQUESTED=0  # Override — this is a restart, not a shutdown
+            continue
+        fi
+
+        # Check if shutdown was requested (container stop, not renewal)
         if [ $SHUTDOWN_REQUESTED -eq 1 ]; then
             echo "  Shutdown was requested, not restarting"
             break
-        fi
-
-        # Check for SSL renewal restart (graceful restart, not a crash)
-        if [ -f /tmp/.ssl-renewal-restart ]; then
-            echo "[entrypoint] SSL renewal restart detected, not counting as crash"
-            continue
         fi
 
         # Fulcrum exited unexpectedly

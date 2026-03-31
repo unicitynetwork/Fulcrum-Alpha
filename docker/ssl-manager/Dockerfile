@@ -28,5 +28,8 @@ RUN chmod +x /usr/local/bin/ssl-setup \
 # ACME challenge webroot directory
 RUN mkdir -p /var/www/acme-challenge/.well-known/acme-challenge
 
+# HTTP reverse proxy port (ACME challenges + app forwarding)
+EXPOSE 80
+
 # Let's Encrypt certificate storage -- mount a volume here
 VOLUME ["/etc/letsencrypt"]
