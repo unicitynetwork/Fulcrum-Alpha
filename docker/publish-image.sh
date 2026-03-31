@@ -63,6 +63,11 @@ if [ -n "${MAKEFLAGS}" ]; then
     BUILD_ARGS="--build-arg MAKEFLAGS=${MAKEFLAGS}"
 fi
 
+# Pull ssl-manager base image (required by Dockerfile)
+echo "Pulling ssl-manager base image..."
+docker pull ghcr.io/unicitynetwork/ssl-manager:latest 2>/dev/null || \
+    echo "Pull failed — using local ssl-manager:latest if available"
+
 # Build the Docker image
 echo "Building Docker image..."
 echo "Build context: ${PROJECT_ROOT}"
