@@ -16,11 +16,20 @@ COPY . .
 RUN qmake -makefile PREFIX=/usr Fulcrum.pro && \
     make $MAKEFLAGS install
 
-FROM debian:trixie-slim
+FROM ssl-manager:latest
 
-RUN apt update && \
-    apt install -y openssl libqt5network5 zlib1g libbz2-1.0 libjemalloc2 libzmq5 python3 libminiupnpc18 \
-    procps netcat-openbsd && \
+# ssl-manager is based on debian:trixie-slim and already includes:
+#   certbot, openssl, curl, jq, netcat-openbsd, python3, procps, ca-certificates
+#
+# Fulcrum-specific runtime dependencies only:
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        libqt5network5 \
+        zlib1g \
+        libbz2-1.0 \
+        libjemalloc2 \
+        libzmq5 \
+        libminiupnpc18 && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
 
@@ -34,20 +43,16 @@ RUN mkdir -p /etc/fulcrum /data
 COPY docker/fulcrum.conf.default /etc/fulcrum/fulcrum.conf.default
 
 VOLUME ["/data"]
+VOLUME ["/etc/letsencrypt"]
 ENV DATA_DIR=/data
 
-ENV SSL_CERTFILE=${DATA_DIR}/fulcrum.crt
-ENV SSL_KEYFILE=${DATA_DIR}/fulcrum.key
-
-# Fulcrum ports
+# Fulcrum Electrum protocol ports
 EXPOSE 50001 50002 50003 50004
-# 50001 - TCP
-# 50002 - SSL
-# 50003 - WebSocket
-# 50004 - WebSocket Secure
+
+# Port 80 is used by ssl-manager's HTTP reverse proxy (EXPOSE'd by base image)
 
 # Health check - verify Fulcrum is responding on TCP port
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD nc -z localhost 50001 || exit 1
 
 COPY docker/docker-entrypoint.sh /entrypoint.sh
