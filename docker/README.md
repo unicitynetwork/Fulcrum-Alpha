@@ -1,166 +1,156 @@
 # Fulcrum-Alpha Docker
 
-Production-ready Docker setup for Fulcrum-Alpha SPV server with SSL/TLS support.
+Production Docker setup for Fulcrum-Alpha SPV server with automatic SSL/TLS and HAProxy integration.
 
 ## Features
 
-- ✅ Docker-only deployment (always runs in containers on `alpha-net` network)
-- ✅ Automatic SSL/TLS configuration with Let's Encrypt
-- ✅ Flexible Alpha RPC endpoint selection (container, localhost, or custom)
-- ✅ Localhost scanning for standalone Alpha nodes
-- ✅ Database auto-cleanup to prevent corruption
-- ✅ Support for TCP, SSL, WebSocket, and WebSocket Secure protocols
-- ✅ Cross-platform: Linux (Ubuntu/CentOS) and macOS
-- ✅ Interactive and non-interactive modes
-- ✅ Optimized for Alpha cryptocurrency (RandomX support)
+- Automatic SSL certificates via Let's Encrypt (certbot, in-container)
+- Automatic HAProxy registration for domain-based routing
+- All 4 Electrum protocols: TCP (50001), SSL (50002), WS (50003), WSS (50004)
+- Certificate auto-renewal (~12h background checks)
+- Based on [ssl-manager](https://github.com/unicitynetwork/ssl-manager) reusable base image
 
 ## Quick Start
 
-### 1. Build the Image
+### 1. Build
+
 ```bash
 cd docker
 ./build.sh
 ```
 
-### 2. Run Fulcrum
+### 2. Run
 
-**Interactive mode (recommended for first-time setup):**
+**Without SSL (TCP only):**
 ```bash
-./run-fulcrum.sh
+./run-fulcrum.sh --no-ssl
 ```
-The script will guide you through:
-- Choosing Alpha RPC endpoint (alpha-node container, localhost, or custom)
-- Entering RPC credentials (defaults: user/password)
-- Configuring SSL/TLS options
-- Selecting Docker image (if multiple available)
-- Choosing SSL certificate (if multiple domains available)
 
-> **Note:** Default configuration connects to `alpha-node` container on the `alpha-net` Docker network.
-
-**Non-interactive examples:**
-
-**Connect to alpha-node container (default):**
+**With SSL and HAProxy (production):**
 ```bash
+./run-fulcrum.sh \
+    --domain electrum.example.com \
+    --ssl-email admin@example.com
+```
+
+**With SSL, no HAProxy (direct):**
+```bash
+./run-fulcrum.sh \
+    --domain electrum.example.com \
+    --ssl-email admin@example.com \
+    --no-haproxy
+```
+
+### 3. Verify
+
+```bash
+# Check logs
+docker logs -f fulcrum-alpha
+
+# Check SSL cert
+echo | openssl s_client -connect electrum.example.com:443 \
+    -servername electrum.example.com 2>/dev/null | \
+    openssl x509 -noout -subject -dates
+
+# Check Electrum protocol
+echo '{"id":1,"method":"server.version","params":["test","1.4"]}' | \
+    nc electrum.example.com 50001
+
+# Check SSL health
+curl -sf http://electrum.example.com/_ssl/health | jq .
+```
+
+## Configuration
+
+### RPC Endpoint
+
+```bash
+# Alpha node in Docker (default)
 ./run-fulcrum.sh --rpc-container alpha-node
-# Uses default credentials: user/password
-```
 
-**Connect to Alpha on localhost (with scanning):**
-```bash
+# Alpha on localhost
 ./run-fulcrum.sh --rpc-localhost
-# Scans localhost:8589 for Alpha node
-```
 
-**Custom RPC endpoint:**
-```bash
+# Custom endpoint
 ./run-fulcrum.sh --rpc-host 192.168.1.10 --rpc-port 8589 --rpc-user myuser --rpc-pass mypass
 ```
 
-**With SSL for specific domain:**
-```bash
-./run-fulcrum.sh --rpc-container alpha-node --domain example.com
+### SSL Options
+
+| Flag | Description |
+|------|-------------|
+| `--domain <domain>` | Domain for SSL certificate (enables SSL) |
+| `--ssl-email <email>` | Email for Let's Encrypt registration |
+| `--ssl-staging` | Use Let's Encrypt staging (test certs, no rate limits) |
+| `--ssl-test-mode` | Self-signed cert for development (never use in prod) |
+| `--ssl-required <bool>` | Fail if SSL setup fails (default: true) |
+| `--no-ssl` | Disable SSL entirely |
+
+### HAProxy Options
+
+| Flag | Description |
+|------|-------------|
+| `--haproxy-host <host>` | HAProxy container hostname (default: haproxy) |
+| `--haproxy-net <network>` | HAProxy Docker network (default: haproxy-net) |
+| `--haproxy-api-key <key>` | Bearer token for Registration API |
+| `--no-haproxy` | Skip HAProxy, expose ports directly |
+
+### Port Options (direct mode only)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--port-tcp` | 50001 | Electrum TCP |
+| `--port-ssl` | 50002 | Electrum SSL |
+| `--port-ws` | 50003 | WebSocket |
+| `--port-wss` | 50004 | WebSocket Secure |
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  HAProxy (haproxy-net)                                      │
+│  :80  → Host routing → fulcrum:80 (ssl-manager proxy)       │
+│  :443 → SNI routing  → fulcrum:50002 (Electrum SSL)         │
+│  :50001 → TCP        → fulcrum:50001 (Electrum TCP)         │
+│  :50003 → HTTP       → fulcrum:50003 (Electrum WS)          │
+│  :50004 → TCP        → fulcrum:50004 (Electrum WSS)         │
+└─────────────────────────────────────────────────────────────┘
+          │
+┌─────────────────────────────────────────────────────────────┐
+│  Fulcrum Container (haproxy-net + alpha-net)                 │
+│                                                             │
+│  ssl-manager layer:                                         │
+│    :80  HTTP reverse proxy (ACME + /_ssl/health)            │
+│    certbot (webroot mode, auto-renewal)                     │
+│    HAProxy registration client                              │
+│                                                             │
+│  Fulcrum service:                                           │
+│    :50001 TCP Electrum                                      │
+│    :50002 SSL Electrum (Let's Encrypt cert)                 │
+│    :50003 WebSocket Electrum                                │
+│    :50004 WebSocket Secure Electrum                         │
+└─────────────────────────────────────────────────────────────┘
+          │
+┌─────────────────────────────────────────────────────────────┐
+│  Alpha Node (alpha-net)                                     │
+│    :8589 JSON-RPC                                           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Disable SSL explicitly:**
-```bash
-./run-fulcrum.sh --rpc-container alpha-node --no-ssl
-```
+## Multi-Network Setup
 
-**Custom ports (if defaults are in use):**
-```bash
-./run-fulcrum.sh --rpc-container alpha-node --port-tcp 60001 --port-ssl 60002 --port-ws 60003 --port-wss 60004
-```
+When using HAProxy, the container joins two networks:
+- `haproxy-net` — for HAProxy registration and proxied traffic
+- `alpha-net` — for Alpha node RPC
 
-### 3. Test the Connection
-```bash
-./test-ssl.sh
-```
+The `run-fulcrum.sh` script uses `docker create` + `docker network connect` + `docker start` to ensure both networks are ready before the entrypoint runs.
 
-## Network Configuration
+## Volumes
 
-The container **always** runs on the `alpha-net` Docker network and exposes the following ports:
-- **50001** - TCP (standard Electrum protocol) - customizable with `--port-tcp`
-- **50002** - SSL/TLS (encrypted Electrum protocol) - customizable with `--port-ssl`
-- **50003** - WebSocket - customizable with `--port-ws`
-- **50004** - WebSocket Secure - customizable with `--port-wss`
-
-**Note:** Admin RPC (8000) and Stats HTTP (8080) are NOT published to the host. Access them via `docker exec` if needed.
-
-## RPC Endpoint Options
-
-### 1. Docker Container (Default)
-Connect to Alpha running in another Docker container on the same `alpha-net` network:
-
-**Interactive:**
-```
-Select Alpha RPC endpoint:
-1. Docker container 'alpha-node' (default, same network)  <-- Select this
-```
-
-**Non-interactive:**
-```bash
-./run-fulcrum.sh --rpc-container alpha-node
-```
-
-### 2. Localhost (Standalone Alpha)
-Connect to Alpha running as a standalone application on the host machine:
-
-**Interactive:**
-```
-Select Alpha RPC endpoint:
-2. Localhost (Alpha running as standalone app on host)  <-- Select this
-```
-The script will scan `localhost:8589` for availability.
-
-**Non-interactive:**
-```bash
-./run-fulcrum.sh --rpc-localhost
-```
-This automatically scans and exits if Alpha is not detected.
-
-### 3. Custom Endpoint
-Connect to Alpha at any custom IP address or hostname:
-
-**Interactive:**
-```
-Select Alpha RPC endpoint:
-3. Custom endpoint  <-- Select this
-```
-
-**Non-interactive:**
-```bash
-./run-fulcrum.sh --rpc-host 192.168.1.10 --rpc-port 8589
-```
-
-## SSL/TLS Setup
-
-SSL is automatically configured when certificates are available. The script supports:
-- Let's Encrypt certificates (auto-detected from `/etc/letsencrypt/live/`)
-- Custom certificates (specify with `--cert` and `--key`)
-- Multiple domains (interactive selection)
-- No SSL mode with `--no-ssl`
-
-For detailed SSL setup instructions, see [SSL_SETUP.md](SSL_SETUP.md).
-
-## Docker Networking
-
-### Always on alpha-net Network
-Fulcrum container is **always** attached to the `alpha-net` Docker network. This allows it to communicate with:
-- `alpha-node` container (default)
-- `explorer` container (if running)
-- Other containers on the same network
-
-### Connecting to Localhost
-When connecting to Alpha on the host machine (`--rpc-localhost`):
-- **Linux**: Uses `--add-host=host.docker.internal:host-gateway`
-- **macOS/Windows**: Uses built-in `host.docker.internal`
-
-This ensures the container can reach the host's `localhost:8589`.
-
-## Storage
-
-**Docker Mode:**
-All blockchain data is stored in a Docker volume `fulcrum-data`. The database is automatically cleaned on each startup to prevent corruption issues.
+| Volume | Mount | Purpose |
+|--------|-------|---------|
+| `fulcrum-data` | `/data` | Blockchain database + generated config |
+| `letsencrypt-data` | `/etc/letsencrypt` | SSL certificates (persist across restarts) |
 
 ## Commands
 
@@ -168,125 +158,29 @@ All blockchain data is stored in a Docker volume `fulcrum-data`. The database is
 # View logs
 docker logs -f fulcrum-alpha
 
-# Stop the container
+# Stop
 docker stop fulcrum-alpha
 
-# Check status
-docker ps | grep fulcrum
+# Admin
+docker exec fulcrum-alpha FulcrumAdmin -p 8000 getinfo
 
-# Admin interface (from inside container)
-docker exec fulcrum-alpha /app/FulcrumAdmin -p 8000 getinfo
+# Check SSL cert expiry
+docker exec fulcrum-alpha certbot certificates
 
-# Stats (from inside container)
-docker exec fulcrum-alpha curl http://localhost:8080
-
-# Test SSL connection
-./test-ssl.sh
-
-# Check network
-docker network inspect alpha-net
+# Force cert renewal
+docker exec fulcrum-alpha certbot renew --force-renewal
 ```
 
-## Multiple Instances
-
-Run multiple Fulcrum instances with different configurations and custom ports:
+## Publishing
 
 ```bash
-# Instance 1 - alpha-node on default ports
-./run-fulcrum.sh --rpc-container alpha-node --container-name fulcrum-1 --no-ssl
-
-# Instance 2 - localhost with SSL on custom ports
-./run-fulcrum.sh --rpc-localhost --domain example.com --container-name fulcrum-2 \
-  --port-tcp 60001 --port-ssl 60002 --port-ws 60003 --port-wss 60004
-```
-
-## Publishing to Registry
-
-To publish the image to a registry:
-```bash
-./publish-image.sh
-```
-
-## Troubleshooting
-
-### SSL Issues
-If SSL is not working:
-1. Check that port 50002 is listening: `nc -zv localhost 50002`
-2. Verify certificates are loaded: `docker logs fulcrum-alpha | grep SSL`
-3. Test SSL handshake: `echo | openssl s_client -connect localhost:50002`
-
-### RPC Connection Issues
-If seeing "Connection refused" errors:
-
-1. **Check Alpha node is running:**
-   ```bash
-   # If alpha-node container
-   docker ps | grep alpha-node
-
-   # If localhost
-   nc -zv localhost 8589
-   ```
-
-2. **Verify network:**
-   ```bash
-   docker network inspect alpha-net
-   # Should show both fulcrum-alpha and alpha-node containers
-   ```
-
-3. **Check configuration:**
-   ```bash
-   docker logs fulcrum-alpha | grep "bitcoind ="
-   # Should show: bitcoind = alpha-node:8589 (or host.docker.internal:8589)
-   ```
-
-4. **Common fixes:**
-   - **For alpha-node container**: Ensure both containers are on `alpha-net` network
-   - **For localhost**: Use `--rpc-localhost` (not `--rpc-host 127.0.0.1`)
-   - **Check credentials**: Default is `user`/`password`, verify with Alpha node config
-
-### Localhost Scanning Fails
-If `--rpc-localhost` reports Alpha not found:
-
-```bash
-# Manually verify Alpha is listening
-nc -zv localhost 8589
-
-# Check Alpha node logs
-# (depends on how you're running Alpha)
-
-# Try continuing anyway (interactive mode will prompt)
-./run-fulcrum.sh
-# Then select option 2 and choose "yes" to continue
+./publish-image.sh           # Push to GHCR
+./publish-image.sh v1.0.0    # Push with version tag
 ```
 
 ## Requirements
 
-**For Docker Mode:**
 - Docker 20.10+
-- Alpha node (in container, localhost, or remote)
-- SSL certificates (optional, for SSL/TLS support)
-
-**Supported Platforms:**
-- Ubuntu 18.04+
-- CentOS 7+/RHEL 7+
-- macOS 10.15+
-- Other Linux distributions with compatible dependencies
-
-## Default Configuration
-
-- **Container name**: `fulcrum-alpha`
-- **Network**: `alpha-net`
-- **RPC endpoint**: `alpha-node:8589`
-- **RPC credentials**: `user` / `password`
-- **Peering**: Disabled
-- **Admin RPC**: Enabled on port 8000
-- **Stats HTTP**: Enabled on port 8080
-
-## Support
-
-For issues specific to Docker setup, please check the logs first:
-```bash
-docker logs fulcrum-alpha
-```
-
-For general Fulcrum-Alpha issues, see the main [README](../README.md).
+- Alpha node with `txindex=1` (in container, localhost, or remote)
+- For SSL: a publicly reachable domain pointing to your server
+- For HAProxy: [HAProxy with Registration API](https://github.com/vrogojin/haproxy) on `haproxy-net`
