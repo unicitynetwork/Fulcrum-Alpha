@@ -16,7 +16,7 @@ COPY . .
 RUN qmake -makefile PREFIX=/usr Fulcrum.pro && \
     make $MAKEFLAGS install
 
-FROM ssl-manager:latest
+FROM ghcr.io/unicitynetwork/ssl-manager:latest
 
 # ssl-manager is based on debian:trixie-slim and already includes:
 #   certbot, openssl, curl, jq, netcat-openbsd, python3, procps, ca-certificates
