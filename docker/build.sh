@@ -11,15 +11,15 @@ echo "Project root: $PROJECT_ROOT"
 
 cd "$PROJECT_ROOT"
 
-# Step 1: Build ssl-manager base image (required by Fulcrum Dockerfile)
+# Pull ssl-manager base image from GHCR (or use local if available)
 echo ""
-echo "Step 1/2: Building ssl-manager base image..."
-docker build -t ssl-manager:latest -f docker/ssl-manager/Dockerfile docker/ssl-manager/
-echo "ssl-manager:latest built successfully"
+echo "Pulling ssl-manager base image..."
+docker pull ghcr.io/unicitynetwork/ssl-manager:latest 2>/dev/null || \
+    echo "Pull failed — using local ssl-manager:latest (build from https://github.com/unicitynetwork/ssl-manager if missing)"
 
-# Step 2: Build Fulcrum image (FROM ssl-manager:latest)
+# Build Fulcrum image
 echo ""
-echo "Step 2/2: Building Fulcrum image..."
+echo "Building Fulcrum image..."
 docker build -t fulcrum-alpha:latest -f docker/Dockerfile .
 
 echo "Build complete!"
