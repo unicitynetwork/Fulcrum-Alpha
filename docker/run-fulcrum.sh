@@ -164,8 +164,8 @@ app_health_check() {
     # 4. SSL protocol check
     if [ -n "$SSL_DOMAIN" ]; then
         local ssl_ver ssl_name
-        ssl_ver=$(echo '{"id":4,"method":"server.version","params":["healthcheck","1.4"]}' | \
-            docker exec -i "$container" openssl s_client -connect localhost:50002 -quiet 2>/dev/null | head -1)
+        ssl_ver=$(timeout 5 docker exec -i "$container" sh -c \
+            'echo "{\"id\":4,\"method\":\"server.version\",\"params\":[\"healthcheck\",\"1.4\"]}" | openssl s_client -connect localhost:50002 -quiet 2>/dev/null | head -1' 2>/dev/null)
         ssl_name=$(echo "$ssl_ver" | jq -r '.result[0]' 2>/dev/null)
         if [ -n "$ssl_name" ] && [ "$ssl_name" != "null" ]; then
             echo "pass:SSL Electrum: $ssl_name"
