@@ -110,8 +110,93 @@ clean_database() {
         fi
     done
     # Remove any other files that aren't config or SSL certificates
-    find /data -maxdepth 1 -type f -not -name "*.conf" -not -name "*.crt" -not -name "*.key" -not -name "*.pem" -delete 2>/dev/null || true
+    find /data -maxdepth 1 -type f -not -name "*.conf" -not -name "*.crt" -not -name "*.key" -not -name "*.pem" -not -name ".crash_state" -delete 2>/dev/null || true
     echo "[entrypoint] Database cleaned"
+}
+
+# ---------------------------------------------------------------------------
+# Crash state persistence (survives container restarts via /data volume)
+# ---------------------------------------------------------------------------
+CRASH_STATE_FILE="/data/.crash_state"
+
+# DB corruption patterns from Fulcrum source code (Storage.cpp)
+DB_CORRUPTION_PATTERNS=(
+    "database.*corrupt"
+    "DatabaseFormatError"
+    "Delete the datadir and resynch"
+    "datadir and resynch"
+    "Corruption:"
+    "Checksum mismatch"
+    "Bad table magic"
+    "RocksDB.*Corruption"
+    "IO error.*rocksdb"
+    "block checksum mismatch"
+    "bad record"
+    "Empty db data"
+    "Missing data for txHash"
+    "Extra bytes at the end of data"
+    "not.*bytes.*Database corruption likely"
+)
+
+# Check if Fulcrum's output indicates database corruption
+detect_db_corruption() {
+    local log_file="$1"
+    for pattern in "${DB_CORRUPTION_PATTERNS[@]}"; do
+        if grep -qiE "$pattern" "$log_file" 2>/dev/null; then
+            echo "[entrypoint] DB corruption detected: $(grep -iE "$pattern" "$log_file" | head -1)"
+            return 0  # Corruption found
+        fi
+    done
+    return 1  # No corruption
+}
+
+# Record a crash event to persistent state
+record_crash() {
+    local exit_code="$1"
+    local corruption_detected="$2"
+    local timestamp
+    timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+    # Read existing state or create new
+    local consecutive_crashes=0
+    if [ -f "$CRASH_STATE_FILE" ]; then
+        consecutive_crashes=$(grep -c "^CRASH:" "$CRASH_STATE_FILE" 2>/dev/null || echo 0)
+    fi
+    consecutive_crashes=$((consecutive_crashes + 1))
+
+    echo "CRASH:${timestamp}:exit=${exit_code}:corruption=${corruption_detected}:consecutive=${consecutive_crashes}" >> "$CRASH_STATE_FILE"
+    echo "[entrypoint] Crash recorded (consecutive: ${consecutive_crashes}, corruption: ${corruption_detected})"
+}
+
+# Clear crash state (called after successful stable run)
+clear_crash_state() {
+    if [ -f "$CRASH_STATE_FILE" ]; then
+        rm -f "$CRASH_STATE_FILE"
+        echo "[entrypoint] Crash state cleared (Fulcrum is stable)"
+    fi
+}
+
+# Check if previous run ended in corruption (recovery mode)
+check_recovery_mode() {
+    if [ ! -f "$CRASH_STATE_FILE" ]; then
+        return 1  # No crash state, normal startup
+    fi
+
+    local last_line
+    last_line=$(tail -1 "$CRASH_STATE_FILE" 2>/dev/null)
+
+    if echo "$last_line" | grep -q "corruption=yes"; then
+        local consecutive
+        consecutive=$(echo "$last_line" | grep -oP 'consecutive=\K[0-9]+')
+        echo "[entrypoint] RECOVERY MODE: Previous crash was due to DB corruption (crash #${consecutive})"
+        echo "[entrypoint] Cleaning database for fresh resync..."
+        clean_database
+        # Keep the crash state file for audit trail but mark recovery started
+        echo "RECOVERY:$(date -u +"%Y-%m-%dT%H:%M:%SZ"):database_cleaned" >> "$CRASH_STATE_FILE"
+        return 0  # Recovery mode activated
+    fi
+
+    return 1  # Previous crash was not corruption
 }
 
 # ---------------------------------------------------------------------------
@@ -215,15 +300,24 @@ run_fulcrum_supervised() {
 
         echo "[entrypoint] Starting Fulcrum (attempt $((RESTART_COUNT + 1))/$MAX_RESTARTS)..."
 
-        # Start Fulcrum in background so we can track its PID
-        Fulcrum "$config_file" "${extra_args[@]}" &
+        # Start Fulcrum in background. Output goes to stdout (docker logs) AND
+        # a rolling crash log for corruption detection after exit.
+        rm -f /tmp/.fulcrum-output
+        Fulcrum "$config_file" "${extra_args[@]}" > >(tee /tmp/.fulcrum-output) 2>&1 &
         FULCRUM_PID=$!
+        FULCRUM_START_TIME=$(date +%s)
         echo "  Fulcrum started with PID $FULCRUM_PID"
 
         # Wait for Fulcrum to exit
         wait $FULCRUM_PID
         EXIT_CODE=$?
         FULCRUM_PID=""
+        FULCRUM_RUN_DURATION=$(( $(date +%s) - FULCRUM_START_TIME ))
+
+        # If Fulcrum ran for more than RESTART_WINDOW, it was stable — clear crash state
+        if [ "$FULCRUM_RUN_DURATION" -gt "$RESTART_WINDOW" ]; then
+            clear_crash_state
+        fi
 
         # Check for SSL renewal restart FIRST (before shutdown check).
         # The deploy hook sends SIGTERM (sets SHUTDOWN_REQUESTED=1) but also
@@ -254,12 +348,22 @@ run_fulcrum_supervised() {
         echo "[entrypoint] Fulcrum crashed with exit code $EXIT_CODE"
         echo "  Restart count: $RESTART_COUNT/$MAX_RESTARTS"
 
+        # Check for DB corruption in Fulcrum's captured output
+        local corruption="no"
+        if detect_db_corruption /tmp/.fulcrum-output; then
+            corruption="yes"
+            echo "[entrypoint] DATABASE CORRUPTION DETECTED — will clean and resync"
+            clean_database
+        else
+            echo "[entrypoint] No DB corruption detected — retrying without database wipe"
+        fi
+
+        # Record crash to persistent state
+        record_crash "$EXIT_CODE" "$corruption"
+
         # Calculate backoff delay
         local delay
         delay=$(calculate_backoff $RESTART_COUNT)
-        echo "  Cleaning database before restart..."
-        clean_database
-
         echo "  Waiting ${delay}s before restart (exponential backoff)..."
 
         # Sleep with interrupt check for graceful shutdown during backoff
@@ -284,8 +388,10 @@ run_fulcrum_supervised() {
 # Main execution
 # ===========================================================================
 
-# Step 1: Optionally clean database on startup (disabled by default to preserve sync)
-if [ "${CLEAN_DB_ON_START:-false}" = "true" ]; then
+# Step 1: Check for recovery mode (previous crash was DB corruption)
+if check_recovery_mode; then
+    echo "[entrypoint] Database cleaned — will resync from scratch"
+elif [ "${CLEAN_DB_ON_START:-false}" = "true" ]; then
     echo "[entrypoint] CLEAN_DB_ON_START is set, cleaning database..."
     clean_database
 fi
