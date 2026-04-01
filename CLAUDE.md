@@ -31,19 +31,15 @@ make -j8
 
 # Docker build and run
 cd docker
-./build.sh                    # Build image
-./run-fulcrum.sh              # Run without SSL
-sudo ./run-fulcrum.sh         # Run with SSL (auto-detect Let's Encrypt certs)
-./run-fulcrum.sh --domain example.com  # Run with specific domain
-./test-ssl.sh                 # Test SSL connection
+./build.sh                    # Build image (pulls ssl-manager from GHCR)
+./run-fulcrum.sh --no-ssl     # Run without SSL (TCP only)
+./run-fulcrum.sh --domain electrum.example.com --ssl-email admin@example.com  # SSL with HAProxy
+./run-fulcrum.sh --domain electrum.example.com --no-haproxy  # SSL direct (no HAProxy)
+./run-fulcrum.sh --help       # Show all options
 
 # Docker management
 docker logs -f fulcrum-alpha  # View logs
 docker stop fulcrum-alpha     # Stop container
-
-# Legacy Docker build (original location)
-cd contrib/docker
-docker build -t fulcrum-alpha .
 ```
 
 ## Architecture Overview
@@ -79,8 +75,10 @@ docker build -t fulcrum-alpha .
 - `src/Mgr.h`: Base manager class providing lifecycle management for subsystems
 - `doc/alpha.conf`: Alpha-specific configuration template
 - `FulcrumAdmin`: Python 3.6+ admin script for server management
-- `docker/run-fulcrum.sh`: Docker runner with SSL auto-detection
-- `docker/README.md`: Docker setup documentation with SSL/TLS instructions
+- `docker/run-fulcrum.sh`: Docker runner (sources `run-lib.sh` from ssl-manager)
+- `docker/run-lib.sh`: Generic ssl-manager startup library (from https://github.com/unicitynetwork/ssl-manager)
+- `docker/docker-entrypoint.sh`: Container entrypoint (ssl-setup, config gen, supervisor with DB corruption recovery)
+- `docker/README.md`: Docker setup documentation with SSL/HAProxy instructions
 
 ## Development Guidelines
 
@@ -146,33 +144,35 @@ The `FulcrumAdmin` script (requires Python 3.6+) provides server management capa
 
 ## Docker Deployment
 
-### Production Setup
-- The `docker/` directory contains production-ready Docker setup with SSL/TLS support
-- `run-fulcrum.sh` provides interactive and non-interactive modes
-- Three RPC endpoint options: Docker container (default), localhost, or custom
-- SSL certificates are auto-detected from Let's Encrypt (`/etc/letsencrypt/live/`)
-- Database is automatically cleaned on container start to prevent corruption
-- Container always runs on `alpha-net` Docker network
-- Network ports: 50001 (TCP), 50002 (SSL), 50003 (WS), 50004 (WSS) - all customizable
+### Architecture
+- Built on [ssl-manager](https://github.com/unicitynetwork/ssl-manager) base image (certbot, HAProxy registration, HTTP reverse proxy)
+- `run-fulcrum.sh` sources `run-lib.sh` (generic ssl-manager startup library)
+- Automatic SSL via Let's Encrypt with certbot (in-container, no host dependencies)
+- Automatic HAProxy registration for domain-based routing (HTTP, HTTPS/SNI, WebSocket, custom TCP)
+- Smart DB corruption detection and auto-recovery (scans crash output for corruption patterns)
+- Container uses `docker create` + `network connect` + `start` to avoid multi-network routing race
+- Network ports: 50001 (TCP), 50002 (SSL), 50003 (WS), 50004 (WSS)
 - Default RPC: `alpha-node:8589` with credentials `user`/`password`
 
-### RPC Endpoint Options
+### Running with SSL and HAProxy
 ```bash
-# Docker container (default)
-./run-fulcrum.sh --rpc-container alpha-node
+cd docker
+./run-fulcrum.sh --domain electrum.example.com --ssl-email admin@example.com
+```
 
-# Localhost (scans for Alpha on host)
-./run-fulcrum.sh --rpc-localhost
+### Running without SSL
+```bash
+./run-fulcrum.sh --no-ssl
+```
 
-# Custom endpoint
+### Custom RPC endpoint
+```bash
 ./run-fulcrum.sh --rpc-host 192.168.1.10 --rpc-port 8589 --rpc-user myuser --rpc-pass mypass
 ```
 
-### Multiple Instances
+### Direct SSL (no HAProxy)
 ```bash
-./run-fulcrum.sh --rpc-container alpha-node --container-name fulcrum-1 --no-ssl
-./run-fulcrum.sh --rpc-localhost --domain example.com --container-name fulcrum-2 \
-  --port-tcp 60001 --port-ssl 60002 --port-ws 60003 --port-wss 60004
+./run-fulcrum.sh --domain electrum.example.com --no-haproxy
 ```
 
 ## Protocol
