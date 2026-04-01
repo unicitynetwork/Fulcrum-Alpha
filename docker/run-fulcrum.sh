@@ -434,18 +434,30 @@ fi
 # Health check — wait for Fulcrum to be ready
 ###############################################################################
 
+# Colors
+C_GREEN='\033[0;32m'
+C_YELLOW='\033[0;33m'
+C_RED='\033[0;31m'
+C_RESET='\033[0m'
+
+check_pass() { printf "  ${C_GREEN}✓${C_RESET} %s\n" "$1"; }
+check_warn() { printf "  ${C_YELLOW}⚠${C_RESET} %s\n" "$1"; }
+check_fail() { printf "  ${C_RED}✗${C_RESET} %s\n" "$1"; }
+
 echo ""
 echo "Waiting for Fulcrum to start..."
 
 HEALTH_TIMEOUT=120
 HEALTH_ELAPSED=0
 HEALTH_STATUS=""
+WARN_COUNT=0
+FAIL_COUNT=0
 
 while [ "$HEALTH_ELAPSED" -lt "$HEALTH_TIMEOUT" ]; do
     # Check if container is still running
     if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" 2>/dev/null | grep -q .; then
         echo ""
-        echo "ERROR: Container '$CONTAINER_NAME' exited unexpectedly." >&2
+        check_fail "Container '$CONTAINER_NAME' exited unexpectedly"
         echo "Last logs:" >&2
         docker logs "$CONTAINER_NAME" 2>&1 | tail -15 >&2
         exit 1
@@ -453,13 +465,11 @@ while [ "$HEALTH_ELAPSED" -lt "$HEALTH_TIMEOUT" ]; do
 
     # Check if Electrum TCP port is listening (Fulcrum is ready)
     if docker exec "$CONTAINER_NAME" nc -z localhost 50001 2>/dev/null; then
-        # If SSL is configured, also check SSL port
         if [ -n "$SSL_DOMAIN" ]; then
             if docker exec "$CONTAINER_NAME" nc -z localhost 50002 2>/dev/null; then
                 HEALTH_STATUS="healthy (TCP + SSL)"
                 break
             else
-                # SSL setup may still be running — show progress
                 printf "\r  SSL setup in progress... (%ds)" "$HEALTH_ELAPSED"
             fi
         else
@@ -477,62 +487,102 @@ done
 echo ""
 
 if [ -n "$HEALTH_STATUS" ]; then
-    echo "Fulcrum is $HEALTH_STATUS"
-
-    # ── Functional verification: query the Electrum protocol ──
     echo ""
-    echo "Running functional checks..."
+    echo "Health & Functional Checks"
+    echo "────────────────────────────────────────"
 
-    # 1. Server version (basic protocol handshake)
+    # ── Port checks ──
+    check_pass "TCP port 50001 listening"
+    if [ -n "$SSL_DOMAIN" ]; then
+        check_pass "SSL port 50002 listening"
+    fi
+
+    # ── 1. Server version ──
     VERSION_RESPONSE=$(echo '{"id":1,"method":"server.version","params":["healthcheck","1.4"]}' | \
         docker exec -i "$CONTAINER_NAME" nc -w3 localhost 50001 2>/dev/null | head -1)
     SERVER_VERSION=$(echo "$VERSION_RESPONSE" | jq -r '.result[0]' 2>/dev/null)
     if [ -n "$SERVER_VERSION" ] && [ "$SERVER_VERSION" != "null" ]; then
-        echo "  Server version: $SERVER_VERSION"
+        check_pass "Server version: $SERVER_VERSION"
     else
-        echo "  WARNING: server.version did not respond"
+        check_fail "server.version did not respond"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
     fi
 
-    # 2. Blockchain tip (proves the node is synced and serving real data)
+    # ── 2. Blockchain tip ──
     TIP_RESPONSE=$(echo '{"id":2,"method":"blockchain.headers.subscribe","params":[]}' | \
         docker exec -i "$CONTAINER_NAME" nc -w3 localhost 50001 2>/dev/null | head -1)
     BLOCK_HEIGHT=$(echo "$TIP_RESPONSE" | jq -r '.result.height' 2>/dev/null)
-    if [ -n "$BLOCK_HEIGHT" ] && [ "$BLOCK_HEIGHT" != "null" ]; then
-        echo "  Block height: $BLOCK_HEIGHT (synced)"
+    if [ -n "$BLOCK_HEIGHT" ] && [ "$BLOCK_HEIGHT" != "null" ] && [ "$BLOCK_HEIGHT" -gt 0 ] 2>/dev/null; then
+        check_pass "Block height: $BLOCK_HEIGHT (synced)"
     else
-        # Fallback: read from container logs
         BLOCK_INFO=$(docker logs "$CONTAINER_NAME" 2>&1 | grep "Block height" | tail -1 | sed 's/.*\] //')
-        [ -n "$BLOCK_INFO" ] && echo "  $BLOCK_INFO"
+        if [ -n "$BLOCK_INFO" ]; then
+            check_warn "$BLOCK_INFO (from logs, protocol query failed)"
+            WARN_COUNT=$((WARN_COUNT + 1))
+        else
+            check_fail "Could not determine block height"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+        fi
     fi
 
-    # 3. Server banner (confirms full protocol functionality)
+    # ── 3. Server banner ──
     BANNER_RESPONSE=$(echo '{"id":3,"method":"server.banner","params":[]}' | \
         docker exec -i "$CONTAINER_NAME" nc -w3 localhost 50001 2>/dev/null | head -1)
     BANNER=$(echo "$BANNER_RESPONSE" | jq -r '.result' 2>/dev/null | head -1)
     if [ -n "$BANNER" ] && [ "$BANNER" != "null" ]; then
-        echo "  Banner: $(echo "$BANNER" | cut -c1-60)"
+        check_pass "Banner: $(echo "$BANNER" | cut -c1-60)"
+    else
+        check_warn "server.banner did not respond (non-critical)"
+        WARN_COUNT=$((WARN_COUNT + 1))
     fi
 
-    # 4. SSL functional check (if configured)
+    # ── 4. SSL checks ──
     if [ -n "$SSL_DOMAIN" ]; then
         SSL_VERSION_RESPONSE=$(echo '{"id":4,"method":"server.version","params":["healthcheck","1.4"]}' | \
             docker exec -i "$CONTAINER_NAME" openssl s_client -connect localhost:50002 -quiet 2>/dev/null | head -1)
         SSL_SERVER=$(echo "$SSL_VERSION_RESPONSE" | jq -r '.result[0]' 2>/dev/null)
         if [ -n "$SSL_SERVER" ] && [ "$SSL_SERVER" != "null" ]; then
-            echo "  SSL protocol: OK ($SSL_SERVER)"
+            check_pass "SSL protocol: $SSL_SERVER"
         else
-            echo "  WARNING: SSL Electrum protocol did not respond"
+            check_fail "SSL Electrum protocol did not respond"
+            FAIL_COUNT=$((FAIL_COUNT + 1))
         fi
 
         CERT_INFO=$(docker exec "$CONTAINER_NAME" openssl x509 -enddate -noout \
             -in "/etc/letsencrypt/live/${SSL_DOMAIN}/fullchain.pem" 2>/dev/null | sed 's/notAfter=//')
-        [ -n "$CERT_INFO" ] && echo "  SSL cert expires: $CERT_INFO"
+        if [ -n "$CERT_INFO" ]; then
+            # Check if cert expires within 14 days
+            CERT_EPOCH=$(date -d "$CERT_INFO" +%s 2>/dev/null || echo 0)
+            NOW_EPOCH=$(date +%s)
+            DAYS_LEFT=$(( (CERT_EPOCH - NOW_EPOCH) / 86400 ))
+            if [ "$DAYS_LEFT" -gt 14 ] 2>/dev/null; then
+                check_pass "SSL cert expires: $CERT_INFO ($DAYS_LEFT days)"
+            elif [ "$DAYS_LEFT" -gt 0 ] 2>/dev/null; then
+                check_warn "SSL cert expires: $CERT_INFO ($DAYS_LEFT days — renew soon!)"
+                WARN_COUNT=$((WARN_COUNT + 1))
+            else
+                check_fail "SSL cert expired: $CERT_INFO"
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+            fi
+        else
+            check_warn "Could not read SSL certificate info"
+            WARN_COUNT=$((WARN_COUNT + 1))
+        fi
     fi
 
-    echo ""
-    echo "All checks passed."
+    # ── Summary line ──
+    echo "────────────────────────────────────────"
+    if [ "$FAIL_COUNT" -gt 0 ]; then
+        printf "${C_RED}RESULT: %d check(s) failed, %d warning(s)${C_RESET}\n" "$FAIL_COUNT" "$WARN_COUNT"
+    elif [ "$WARN_COUNT" -gt 0 ]; then
+        printf "${C_YELLOW}RESULT: All critical checks passed, %d warning(s)${C_RESET}\n" "$WARN_COUNT"
+    else
+        printf "${C_GREEN}RESULT: All checks passed${C_RESET}\n"
+    fi
 else
-    echo "WARNING: Fulcrum did not become healthy within ${HEALTH_TIMEOUT}s"
+    echo ""
+    echo "────────────────────────────────────────"
+    printf "${C_RED}RESULT: Fulcrum did not become healthy within ${HEALTH_TIMEOUT}s${C_RESET}\n"
     echo "  It may still be starting (SSL setup, initial sync, etc.)"
     echo "  Check logs: docker logs -f $CONTAINER_NAME"
 fi
