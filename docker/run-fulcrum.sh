@@ -346,9 +346,9 @@ fi
 
 PORT_ARGS=()
 if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
-    # Behind HAProxy: Electrum SSL/WS/WSS traffic routed through HAProxy.
-    # Only publish TCP for direct access (optional).
-    PORT_ARGS+=( -p "${PORT_TCP}:50001" )
+    # Behind HAProxy: all traffic routed through HAProxy.
+    # No ports published — HAProxy owns 80, 443, 50001-50004.
+    true  # PORT_ARGS stays empty
 else
     # Direct mode: publish all ports
     PORT_ARGS+=(
