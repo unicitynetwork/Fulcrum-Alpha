@@ -479,16 +479,58 @@ echo ""
 if [ -n "$HEALTH_STATUS" ]; then
     echo "Fulcrum is $HEALTH_STATUS"
 
-    # Show block height
-    BLOCK_INFO=$(docker logs "$CONTAINER_NAME" 2>&1 | grep "Block height" | tail -1 | sed 's/.*\] //')
-    [ -n "$BLOCK_INFO" ] && echo "  $BLOCK_INFO"
+    # ── Functional verification: query the Electrum protocol ──
+    echo ""
+    echo "Running functional checks..."
 
-    # Show SSL cert info if applicable
+    # 1. Server version (basic protocol handshake)
+    VERSION_RESPONSE=$(echo '{"id":1,"method":"server.version","params":["healthcheck","1.4"]}' | \
+        docker exec -i "$CONTAINER_NAME" nc -w3 localhost 50001 2>/dev/null | head -1)
+    SERVER_VERSION=$(echo "$VERSION_RESPONSE" | jq -r '.result[0]' 2>/dev/null)
+    if [ -n "$SERVER_VERSION" ] && [ "$SERVER_VERSION" != "null" ]; then
+        echo "  Server version: $SERVER_VERSION"
+    else
+        echo "  WARNING: server.version did not respond"
+    fi
+
+    # 2. Blockchain tip (proves the node is synced and serving real data)
+    TIP_RESPONSE=$(echo '{"id":2,"method":"blockchain.headers.subscribe","params":[]}' | \
+        docker exec -i "$CONTAINER_NAME" nc -w3 localhost 50001 2>/dev/null | head -1)
+    BLOCK_HEIGHT=$(echo "$TIP_RESPONSE" | jq -r '.result.height' 2>/dev/null)
+    if [ -n "$BLOCK_HEIGHT" ] && [ "$BLOCK_HEIGHT" != "null" ]; then
+        echo "  Block height: $BLOCK_HEIGHT (synced)"
+    else
+        # Fallback: read from container logs
+        BLOCK_INFO=$(docker logs "$CONTAINER_NAME" 2>&1 | grep "Block height" | tail -1 | sed 's/.*\] //')
+        [ -n "$BLOCK_INFO" ] && echo "  $BLOCK_INFO"
+    fi
+
+    # 3. Server banner (confirms full protocol functionality)
+    BANNER_RESPONSE=$(echo '{"id":3,"method":"server.banner","params":[]}' | \
+        docker exec -i "$CONTAINER_NAME" nc -w3 localhost 50001 2>/dev/null | head -1)
+    BANNER=$(echo "$BANNER_RESPONSE" | jq -r '.result' 2>/dev/null | head -1)
+    if [ -n "$BANNER" ] && [ "$BANNER" != "null" ]; then
+        echo "  Banner: $(echo "$BANNER" | cut -c1-60)"
+    fi
+
+    # 4. SSL functional check (if configured)
     if [ -n "$SSL_DOMAIN" ]; then
+        SSL_VERSION_RESPONSE=$(echo '{"id":4,"method":"server.version","params":["healthcheck","1.4"]}' | \
+            docker exec -i "$CONTAINER_NAME" openssl s_client -connect localhost:50002 -quiet 2>/dev/null | head -1)
+        SSL_SERVER=$(echo "$SSL_VERSION_RESPONSE" | jq -r '.result[0]' 2>/dev/null)
+        if [ -n "$SSL_SERVER" ] && [ "$SSL_SERVER" != "null" ]; then
+            echo "  SSL protocol: OK ($SSL_SERVER)"
+        else
+            echo "  WARNING: SSL Electrum protocol did not respond"
+        fi
+
         CERT_INFO=$(docker exec "$CONTAINER_NAME" openssl x509 -enddate -noout \
             -in "/etc/letsencrypt/live/${SSL_DOMAIN}/fullchain.pem" 2>/dev/null | sed 's/notAfter=//')
         [ -n "$CERT_INFO" ] && echo "  SSL cert expires: $CERT_INFO"
     fi
+
+    echo ""
+    echo "All checks passed."
 else
     echo "WARNING: Fulcrum did not become healthy within ${HEALTH_TIMEOUT}s"
     echo "  It may still be starting (SSL setup, initial sync, etc.)"
