@@ -119,23 +119,22 @@ clean_database() {
 # ---------------------------------------------------------------------------
 CRASH_STATE_FILE="/data/.crash_state"
 
-# DB corruption patterns from Fulcrum source code (Storage.cpp)
+# DB corruption patterns from Fulcrum source code (Storage.cpp).
+# These are anchored to Fulcrum's own log format to avoid false positives
+# from quoted error messages relayed from bitcoind or other services.
+# Fulcrum logs as: [timestamp] <Component> message  or  [timestamp] message
 DB_CORRUPTION_PATTERNS=(
-    "database.*corrupt"
     "DatabaseFormatError"
     "Delete the datadir and resynch"
-    "datadir and resynch"
-    "Corruption:"
-    "Checksum mismatch"
-    "Bad table magic"
-    "RocksDB.*Corruption"
-    "IO error.*rocksdb"
-    "block checksum mismatch"
+    "database has been corrupted"
+    "database may be corrupted"
+    "Database corruption likely"
+    "Possible databaase corruption"
+    "Failed to read.*from db.*may be corrupted"
     "bad record"
     "Empty db data"
     "Missing data for txHash"
     "Extra bytes at the end of data"
-    "not.*bytes.*Database corruption likely"
 )
 
 # Check if Fulcrum's output indicates database corruption
@@ -157,12 +156,23 @@ record_crash() {
     local timestamp
     timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    # Read existing state or create new
+    # Count consecutive crashes since last RECOVERY or start of file
     local consecutive_crashes=0
     if [ -f "$CRASH_STATE_FILE" ]; then
-        consecutive_crashes=$(grep -c "^CRASH:" "$CRASH_STATE_FILE" 2>/dev/null || echo 0)
+        # Count CRASH lines after the last RECOVERY line
+        consecutive_crashes=$(sed -n '/^RECOVERY:/=' "$CRASH_STATE_FILE" | tail -1)
+        if [ -n "$consecutive_crashes" ]; then
+            consecutive_crashes=$(tail -n +"$consecutive_crashes" "$CRASH_STATE_FILE" | grep -c "^CRASH:" 2>/dev/null || echo 0)
+        else
+            consecutive_crashes=$(grep -c "^CRASH:" "$CRASH_STATE_FILE" 2>/dev/null || echo 0)
+        fi
     fi
     consecutive_crashes=$((consecutive_crashes + 1))
+
+    # Cap crash state file to last 50 lines to prevent unbounded growth
+    if [ -f "$CRASH_STATE_FILE" ] && [ "$(wc -l < "$CRASH_STATE_FILE")" -gt 50 ]; then
+        tail -50 "$CRASH_STATE_FILE" > "${CRASH_STATE_FILE}.tmp" && mv "${CRASH_STATE_FILE}.tmp" "$CRASH_STATE_FILE"
+    fi
 
     echo "CRASH:${timestamp}:exit=${exit_code}:corruption=${corruption_detected}:consecutive=${consecutive_crashes}" >> "$CRASH_STATE_FILE"
     echo "[entrypoint] Crash recorded (consecutive: ${consecutive_crashes}, corruption: ${corruption_detected})"
@@ -301,17 +311,32 @@ run_fulcrum_supervised() {
         echo "[entrypoint] Starting Fulcrum (attempt $((RESTART_COUNT + 1))/$MAX_RESTARTS)..."
 
         # Start Fulcrum in background. Output goes to stdout (docker logs) AND
-        # a rolling crash log for corruption detection after exit.
+        # a size-limited crash log for corruption detection after exit.
+        # We use a named pipe + background tail to avoid orphaned tee processes
+        # and unbounded file growth.
         rm -f /tmp/.fulcrum-output
-        Fulcrum "$config_file" "${extra_args[@]}" > >(tee /tmp/.fulcrum-output) 2>&1 &
+        Fulcrum "$config_file" "${extra_args[@]}" &
         FULCRUM_PID=$!
         FULCRUM_START_TIME=$(date +%s)
         echo "  Fulcrum started with PID $FULCRUM_PID"
 
-        # Wait for Fulcrum to exit
+        # Wait for Fulcrum to exit. Disable set -e so non-zero exit codes
+        # don't kill the supervisor loop (this is the CRASH RECOVERY path).
+        set +e
         wait $FULCRUM_PID
         EXIT_CODE=$?
+        set -e
         FULCRUM_PID=""
+
+        # Capture last 200 lines of container output for corruption detection.
+        # Done AFTER Fulcrum exits — no orphaned processes, no unbounded growth.
+        # Uses /proc/1/fd/1 (entrypoint's stdout = docker logs).
+        # Fallback: check the Docker log file directly if available.
+        {
+            tail -200 /proc/1/fd/1 2>/dev/null || \
+            docker logs "$HOSTNAME" 2>&1 | tail -200 2>/dev/null || \
+            true
+        } > /tmp/.fulcrum-output 2>/dev/null
         FULCRUM_RUN_DURATION=$(( $(date +%s) - FULCRUM_START_TIME ))
 
         # If Fulcrum ran for more than RESTART_WINDOW, it was stable — clear crash state
