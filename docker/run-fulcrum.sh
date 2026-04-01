@@ -431,6 +431,71 @@ if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ]; then
 fi
 
 ###############################################################################
+# Health check — wait for Fulcrum to be ready
+###############################################################################
+
+echo ""
+echo "Waiting for Fulcrum to start..."
+
+HEALTH_TIMEOUT=120
+HEALTH_ELAPSED=0
+HEALTH_STATUS=""
+
+while [ "$HEALTH_ELAPSED" -lt "$HEALTH_TIMEOUT" ]; do
+    # Check if container is still running
+    if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" 2>/dev/null | grep -q .; then
+        echo ""
+        echo "ERROR: Container '$CONTAINER_NAME' exited unexpectedly." >&2
+        echo "Last logs:" >&2
+        docker logs "$CONTAINER_NAME" 2>&1 | tail -15 >&2
+        exit 1
+    fi
+
+    # Check if Electrum TCP port is listening (Fulcrum is ready)
+    if docker exec "$CONTAINER_NAME" nc -z localhost 50001 2>/dev/null; then
+        # If SSL is configured, also check SSL port
+        if [ -n "$SSL_DOMAIN" ]; then
+            if docker exec "$CONTAINER_NAME" nc -z localhost 50002 2>/dev/null; then
+                HEALTH_STATUS="healthy (TCP + SSL)"
+                break
+            else
+                # SSL setup may still be running — show progress
+                printf "\r  SSL setup in progress... (%ds)" "$HEALTH_ELAPSED"
+            fi
+        else
+            HEALTH_STATUS="healthy (TCP)"
+            break
+        fi
+    else
+        printf "\r  Starting up... (%ds)" "$HEALTH_ELAPSED"
+    fi
+
+    sleep 2
+    HEALTH_ELAPSED=$((HEALTH_ELAPSED + 2))
+done
+
+echo ""
+
+if [ -n "$HEALTH_STATUS" ]; then
+    echo "Fulcrum is $HEALTH_STATUS"
+
+    # Show block height
+    BLOCK_INFO=$(docker logs "$CONTAINER_NAME" 2>&1 | grep "Block height" | tail -1 | sed 's/.*\] //')
+    [ -n "$BLOCK_INFO" ] && echo "  $BLOCK_INFO"
+
+    # Show SSL cert info if applicable
+    if [ -n "$SSL_DOMAIN" ]; then
+        CERT_INFO=$(docker exec "$CONTAINER_NAME" openssl x509 -enddate -noout \
+            -in "/etc/letsencrypt/live/${SSL_DOMAIN}/fullchain.pem" 2>/dev/null | sed 's/notAfter=//')
+        [ -n "$CERT_INFO" ] && echo "  SSL cert expires: $CERT_INFO"
+    fi
+else
+    echo "WARNING: Fulcrum did not become healthy within ${HEALTH_TIMEOUT}s"
+    echo "  It may still be starting (SSL setup, initial sync, etc.)"
+    echo "  Check logs: docker logs -f $CONTAINER_NAME"
+fi
+
+###############################################################################
 # Summary
 ###############################################################################
 
