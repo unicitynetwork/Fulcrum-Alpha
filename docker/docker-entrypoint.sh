@@ -134,6 +134,15 @@ DB_CORRUPTION_PATTERNS=(
     "Empty db data"
     "Missing data for txHash"
     "Extra bytes at the end of data"
+    # Failed-reorg / inconsistent-state class (Controller.cpp rewind path).
+    # A deep reorg the node can't undo leaves the DB inconsistent; Fulcrum's
+    # own instruction is to delete the datadir and resync. These strings are
+    # distinct from the corruption messages above and were previously missed,
+    # causing the supervisor to retry-without-wipe until Docker gave up.
+    "The database is now likely in an inconsistent state"
+    "Failed to rewind"
+    "Unable to retrieve undo info"
+    "delete the datadir and do a full resynch"
 )
 
 # Check if Fulcrum's output indicates database corruption
