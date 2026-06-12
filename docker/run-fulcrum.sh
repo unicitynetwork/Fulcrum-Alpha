@@ -23,8 +23,11 @@ APP_TITLE="Fulcrum-Alpha SPV Server"
 APP_NET="${APP_NET:-alpha-net}"
 DATA_VOLUME="${DATA_VOLUME:-fulcrum-data}"
 HEALTH_PORT=50001                    # Electrum TCP — first port to come up
-SSL_CHECK_PORT=50002                 # Electrum SSL — verify after SSL setup
-SSL_HTTPS_PORT="${SSL_HTTPS_PORT:-50002}"
+SSL_CHECK_PORT=50002                 # Electrum SSL — verify Fulcrum's internal listener after SSL setup
+# The domain's main TLS port (HAProxy 443 SNI → this Fulcrum port). We point it
+# at WSS (50004) so wss://<domain> works on the default 443 (browser/firewall
+# friendly). Electrum-SSL stays reachable on :50002 via EXTRA_PORTS below.
+SSL_HTTPS_PORT="${SSL_HTTPS_PORT:-50004}"
 APP_HTTP_PORT="${APP_HTTP_PORT:-0}"   # Fulcrum doesn't serve HTTP
 
 # ─── App defaults ─────────────────────────────────────────────────────────────
@@ -92,9 +95,11 @@ app_port_args() {
 }
 
 app_docker_args() {
-    # Auto-populate HAProxy extra ports for Fulcrum's 4 protocols
+    # Auto-populate HAProxy extra ports for Fulcrum's protocols.
+    # 443 (SSL_HTTPS_PORT) already maps to WSS (50004), so the explicit extra
+    # ports cover: TCP (50001), Electrum-SSL (50002), WS (50003), WSS (50004).
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ] && [ -z "$EXTRA_PORTS" ]; then
-        EXTRA_PORTS='[{"listen":50001,"target":50001,"mode":"tcp"},{"listen":50003,"target":50003,"mode":"http"},{"listen":50004,"target":50004,"mode":"tcp"}]'
+        EXTRA_PORTS='[{"listen":50001,"target":50001,"mode":"tcp"},{"listen":50002,"target":50002,"mode":"tcp"},{"listen":50003,"target":50003,"mode":"http"},{"listen":50004,"target":50004,"mode":"tcp"}]'
         echo "-e EXTRA_PORTS=$EXTRA_PORTS"
     fi
 }
@@ -179,9 +184,11 @@ app_summary() {
     echo ""
     echo "Endpoints:"
     if [ "$USE_HAPROXY" = true ] && [ -n "$HAPROXY_HOST" ] && [ -n "$SSL_DOMAIN" ]; then
-        echo "  Electrum SSL:  $SSL_DOMAIN:443 (via HAProxy)"
-        echo "  Electrum WS:   $SSL_DOMAIN:50003 (via HAProxy)"
-        echo "  Electrum WSS:  $SSL_DOMAIN:50004 (via HAProxy)"
+        echo "  Electrum WSS:  wss://$SSL_DOMAIN (443, default port via HAProxy)"
+        echo "  Electrum WSS:  wss://$SSL_DOMAIN:50004 (via HAProxy)"
+        echo "  Electrum SSL:  $SSL_DOMAIN:50002 (via HAProxy)"
+        echo "  Electrum WS:   ws://$SSL_DOMAIN:50003 (via HAProxy)"
+        echo "  Electrum TCP:  $SSL_DOMAIN:50001 (via HAProxy)"
     else
         echo "  Electrum TCP:  localhost:$PORT_TCP"
         [ -n "$SSL_DOMAIN" ] && echo "  Electrum SSL:  localhost:$PORT_SSL"
