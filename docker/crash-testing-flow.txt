@@ -1,0 +1,89 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║                    Fulcrum Crash Recovery Test Flow                       ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          test-recovery.sh                               │
+│                     (Orchestrates All Tests)                            │
+└────────┬────────────────────────────────────────────────┬───────────────┘
+         │                                                │
+         ▼                                                ▼
+┌────────────────────────────┐                ┌──────────────────────────┐
+│ Scenario 1: Process Crash  │                │ Scenario 2: Container    │
+│                            │                │         Crash            │
+│  crash-fulcrum-process.sh  │                │  crash-container.sh      │
+└────────┬───────────────────┘                └───────────┬──────────────┘
+         │                                                │
+         ▼                                                ▼
+┌────────────────────────────┐                ┌──────────────────────────┐
+│  Docker Container          │                │  Docker Container        │
+│  ┌──────────────────────┐  │                │  ┌────────────────────┐  │
+│  │ Supervisor (PID 1)   │  │                │  │ Fulcrum (PID 1)    │  │
+│  │  ┌────────────────┐  │  │                │  └────────────────────┘  │
+│  │  │ Fulcrum        │←─┼──┼── kill signal  │           ↓              │
+│  │  └────────────────┘  │  │                │      Container exits     │
+│  └──────────────────────┘  │                └──────────────────────────┘
+│           ↓                │                             ↓
+│    Supervisor detects      │                  Docker auto-restart
+│    and restarts Fulcrum    │                  (--restart always)
+│           ↓                │                             ↓
+│  ┌──────────────────────┐  │                ┌──────────────────────────┐
+│  │ Fulcrum (new PID)    │  │                │  New Container           │
+│  └──────────────────────┘  │                │  ┌────────────────────┐  │
+└────────────────────────────┘                │  │ Fulcrum (PID 1)    │  │
+                                              │  └────────────────────┘  │
+                                              └──────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════
+
+                        Verification Checks
+                        (Both Scenarios)
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                                                                         │
+│  1. ✓ Fulcrum Process Running                                          │
+│     └─ pgrep -x Fulcrum                                                 │
+│                                                                         │
+│  2. ✓ Container Running                                                 │
+│     └─ docker ps | grep fulcrum-alpha                                   │
+│                                                                         │
+│  3. ✓ SSL Certificates Preserved                                        │
+│     └─ test -d /etc/letsencrypt/live                                    │
+│                                                                         │
+│  4. ✓ Database Integrity                                                │
+│     └─ test -d /fulcrum/db                                              │
+│                                                                         │
+│  5. ✓ Port Connectivity                                                 │
+│     ├─ nc -zv localhost 50001  (TCP)                                    │
+│     ├─ nc -zv localhost 50002  (SSL)                                    │
+│     ├─ nc -zv localhost 50003  (WS)                                     │
+│     └─ nc -zv localhost 50004  (WSS)                                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════
+
+                         Signal Types
+
+┌──────────┬─────────┬──────────────────────────────────────────┐
+│ Signal   │ Number  │ Effect                                   │
+├──────────┼─────────┼──────────────────────────────────────────┤
+│ SIGTERM  │   15    │ Graceful shutdown (catchable)            │
+│ SIGKILL  │    9    │ Immediate death (not catchable)          │
+│ SIGABRT  │    6    │ Abnormal termination (crash simulation)  │
+│ SIGSEGV  │   11    │ Segmentation fault (memory error)        │
+└──────────┴─────────┴──────────────────────────────────────────┘
+
+═══════════════════════════════════════════════════════════════════════════
+
+                    Expected Recovery Times
+
+┌─────────────────────────────────────────┬──────────────────┐
+│ Scenario                                │ Recovery Time    │
+├─────────────────────────────────────────┼──────────────────┤
+│ Process crash (with supervisor)         │  2-5 seconds     │
+│ Process crash (without supervisor)      │  5-15 seconds    │
+│ Container crash (Docker restart)        │  5-20 seconds    │
+│ Container crash (with large database)   │  15-45 seconds   │
+└─────────────────────────────────────────┴──────────────────┘
+

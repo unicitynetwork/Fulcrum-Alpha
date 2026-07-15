@@ -1,0 +1,204 @@
+╔═══════════════════════════════════════════════════════════════════════════╗
+║              Fulcrum Crash Recovery Testing - File Index                  ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+
+EXECUTABLE SCRIPTS (chmod +x applied)
+──────────────────────────────────────────────────────────────────────────────
+
+1. crash-fulcrum-process.sh (7.9 KB)
+   Purpose: Kill Fulcrum process to test supervisor recovery
+   Usage:   ./crash-fulcrum-process.sh [--signal SIGKILL|SIGTERM|etc]
+   Tests:   Process-level crash, supervisor restart
+
+2. crash-container.sh (13 KB)
+   Purpose: Kill entire container to test Docker auto-restart
+   Usage:   ./crash-container.sh [--method pid1-kill|pid1-abort|stop-start]
+   Tests:   Container-level crash, Docker restart policy
+
+3. test-recovery.sh (17 KB)
+   Purpose: Comprehensive test suite for both scenarios
+   Usage:   ./test-recovery.sh [--verbose] [--skip-process] [--skip-container]
+   Tests:   Both scenarios + SSL preservation + port connectivity
+
+
+DOCUMENTATION FILES
+──────────────────────────────────────────────────────────────────────────────
+
+4. CRASH_RECOVERY_TESTING.md (13 KB)
+   Complete documentation covering:
+   - Architecture diagrams
+   - Prerequisites and setup
+   - Usage instructions
+   - Signal reference
+   - Troubleshooting guide
+   - Best practices
+   - CI/CD integration
+
+5. CRASH_TESTING_QUICKREF.md (2.9 KB)
+   Quick reference card with:
+   - Common commands
+   - Crash methods
+   - Diagnostic checks
+   - Troubleshooting one-liners
+
+6. CRASH_TESTING_SUMMARY.md (Current file size varies)
+   Implementation summary containing:
+   - What was created
+   - How it works
+   - Expected results
+   - Integration examples
+   - Troubleshooting
+   - Next steps
+
+7. crash-testing-flow.txt
+   Visual ASCII diagram showing:
+   - Test flow architecture
+   - Crash scenario differences
+   - Verification steps
+   - Signal types
+   - Recovery time estimates
+
+
+CONFIGURATION FILES
+──────────────────────────────────────────────────────────────────────────────
+
+8. supervisord.conf.example
+   Example supervisord configuration for:
+   - Process supervision
+   - Auto-restart on crash
+   - Logging setup
+   - Optional database cleanup
+
+
+QUICK START
+──────────────────────────────────────────────────────────────────────────────
+
+To run all tests:
+    cd /home/vrogojin/Fulcrum-Alpha/docker
+    ./test-recovery.sh
+
+To test process crash only:
+    ./crash-fulcrum-process.sh
+
+To test container crash only:
+    ./crash-container.sh
+
+To view full documentation:
+    cat CRASH_RECOVERY_TESTING.md
+    # or
+    less CRASH_RECOVERY_TESTING.md
+
+
+FILE LOCATIONS
+──────────────────────────────────────────────────────────────────────────────
+
+All files located in: /home/vrogojin/Fulcrum-Alpha/docker/
+
+crash-fulcrum-process.sh          [rwxrwxr-x]  Executable
+crash-container.sh                [rwxrwxr-x]  Executable
+test-recovery.sh                  [rwxrwxr-x]  Executable
+CRASH_RECOVERY_TESTING.md         [rw-rw-r--]  Documentation
+CRASH_TESTING_QUICKREF.md         [rw-rw-r--]  Documentation
+CRASH_TESTING_SUMMARY.md          [rw-rw-r--]  Documentation
+crash-testing-flow.txt            [rw-rw-r--]  Diagram
+supervisord.conf.example          [rw-rw-r--]  Config template
+crash-testing-files.txt           [rw-rw-r--]  This file
+
+
+FEATURES IMPLEMENTED
+──────────────────────────────────────────────────────────────────────────────
+
+✓ Defensive programming (set -Eeuo pipefail)
+✓ Comprehensive error handling
+✓ Input validation
+✓ Prerequisite checking
+✓ Color-coded output
+✓ Verbose/debug modes
+✓ Multiple crash methods
+✓ Recovery verification
+✓ SSL certificate checks
+✓ Port connectivity tests
+✓ Database integrity checks
+✓ Container state tracking
+✓ Process supervisor detection
+✓ Restart policy validation
+✓ Detailed logging
+✓ Usage documentation
+✓ Help text (--help)
+✓ Exit code standards
+✓ POSIX compatibility
+✓ Cross-platform support (Linux focus)
+
+
+TESTING SCENARIOS COVERED
+──────────────────────────────────────────────────────────────────────────────
+
+Process-Level Crashes:
+  • SIGKILL - Hard crash simulation
+  • SIGTERM - Graceful termination
+  • SIGABRT - Abnormal exit
+  • SIGSEGV - Segmentation fault
+
+Container-Level Crashes:
+  • PID 1 kill (SIGKILL)
+  • PID 1 abort (SIGABRT)
+  • PID 1 term (SIGTERM)
+  • Docker stop/restart
+  • OOM trigger (optional)
+
+Verification Checks:
+  • Process running status
+  • Container running status
+  • SSL certificate preservation
+  • Database integrity
+  • Port connectivity (50001-50004)
+  • Container uptime tracking
+  • Restart count monitoring
+
+
+SHELL FEATURES USED
+──────────────────────────────────────────────────────────────────────────────
+
+Bash 4.4+ features:
+  • [[ ]] conditionals
+  • Associative arrays
+  • printf-based output
+  • Command substitution $()
+  • Process substitution <()
+  • String manipulation ${var//pattern/replacement}
+  • Regex matching =~
+  • Arrays and array operations
+  • Proper quoting throughout
+
+Defensive patterns:
+  • Strict mode (set -Eeuo pipefail)
+  • Error traps
+  • Variable quoting
+  • -- separator for arguments
+  • Input validation
+  • Prerequisite checking
+  • Exit code propagation
+
+
+COMPATIBILITY
+──────────────────────────────────────────────────────────────────────────────
+
+Tested on:      Linux (Debian-based systems)
+Bash version:   4.4+ or 5.x
+Docker:         Any recent version
+Required:       docker, pgrep, kill
+Optional:       nc/netcat (for port testing)
+                timeout command
+
+
+NEXT STEPS
+──────────────────────────────────────────────────────────────────────────────
+
+1. Review documentation: cat CRASH_RECOVERY_TESTING.md
+2. Test prerequisites: docker ps
+3. Run initial test: ./test-recovery.sh --verbose
+4. Consider adding supervisor (see supervisord.conf.example)
+5. Schedule regular testing
+6. Integrate with monitoring
+7. Set up alerting
+
