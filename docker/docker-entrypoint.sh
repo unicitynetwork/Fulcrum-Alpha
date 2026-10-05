@@ -324,6 +324,27 @@ run_fulcrum_supervised() {
         FULCRUM_START_TIME=$(date +%s)
         echo "  Fulcrum started with PID $FULCRUM_PID"
 
+        # SSL renewal watcher. The ssl-renew deploy-hook only *touches* the
+        # marker file (/tmp/.ssl-renewal-restart) — it does NOT signal Fulcrum.
+        # Since Fulcrum loads its cert into memory at startup and can run for
+        # months without exiting, a renewed cert would otherwise never be picked
+        # up (the marker is only consumed when the supervisor loop iterates,
+        # i.e. when Fulcrum exits). This watcher polls for the marker while
+        # Fulcrum runs and, when it appears, gracefully stops Fulcrum so the
+        # post-exit handler below reloads the new cert. The marker is left in
+        # place for that handler to consume.
+        (
+            while kill -0 "$FULCRUM_PID" 2>/dev/null; do
+                if [ -f /tmp/.ssl-renewal-restart ]; then
+                    echo "[entrypoint] SSL renewal marker detected — signaling Fulcrum (PID $FULCRUM_PID) to reload cert"
+                    kill -TERM "$FULCRUM_PID" 2>/dev/null || true
+                    break
+                fi
+                sleep 30
+            done
+        ) &
+        RENEW_WATCHER_PID=$!
+
         # Wait for Fulcrum to exit. Disable set -e so non-zero exit codes
         # don't kill the supervisor loop — this is the CRASH RECOVERY path.
         set +e
@@ -332,9 +353,16 @@ run_fulcrum_supervised() {
         set -e
         FULCRUM_PID=""
 
+        # Stop the renewal watcher (no-op if it already fired/exited)
+        kill "$RENEW_WATCHER_PID" 2>/dev/null || true
+        wait "$RENEW_WATCHER_PID" 2>/dev/null || true
+
         # Capture last 200 lines of output for corruption detection (post-exit,
-        # no orphaned processes, no unbounded file growth)
-        tail -200 /proc/1/fd/1 > /tmp/.fulcrum-output 2>/dev/null || true
+        # no orphaned processes, no unbounded file growth). Wrapped in `timeout`
+        # because /proc/1/fd/1 is a live pipe to the Docker log driver — a plain
+        # `tail` reads until EOF and would block the supervisor forever, leaving
+        # Fulcrum down after an exit.
+        timeout 3 tail -200 /proc/1/fd/1 > /tmp/.fulcrum-output 2>/dev/null || true
         FULCRUM_RUN_DURATION=$(( $(date +%s) - FULCRUM_START_TIME ))
 
         # If Fulcrum ran for more than RESTART_WINDOW, it was stable — clear crash state
@@ -343,8 +371,9 @@ run_fulcrum_supervised() {
         fi
 
         # Check for SSL renewal restart FIRST (before shutdown check).
-        # The deploy hook sends SIGTERM (sets SHUTDOWN_REQUESTED=1) but also
-        # touches the marker file. We must detect this BEFORE breaking out.
+        # The renewal watcher above (or an external SIGTERM) may have stopped
+        # Fulcrum with the marker file present. Detect this BEFORE breaking out
+        # so a cert renewal triggers a reload rather than a shutdown.
         if [ -f /tmp/.ssl-renewal-restart ]; then
             rm -f /tmp/.ssl-renewal-restart
             echo "[entrypoint] SSL certificate renewed — restarting Fulcrum to load new cert"
