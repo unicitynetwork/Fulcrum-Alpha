@@ -178,6 +178,11 @@ docker exec fulcrum-alpha certbot renew --force-renewal
 ./publish-image.sh v1.0.0    # Push with version tag
 ```
 
+## Troubleshooting
+
+See [INCIDENTS.md](INCIDENTS.md) for a log of past production incidents (Alpha-node
+reindex loop, expired-cert / renewal-reload), their root causes, fixes, and diagnosis steps.
+
 ## Requirements
 
 - Docker 20.10+
